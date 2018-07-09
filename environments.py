@@ -24,82 +24,52 @@ import os.path
 import numpy as np
 import tensorflow as tf
 
-import deepmind_lab
+import jeju_env
 
 
 nest = tf.contrib.framework.nest
 
-
-class LocalLevelCache(object):
-  """Local level cache."""
-
-  def __init__(self, cache_dir='/tmp/level_cache'):
-    self._cache_dir = cache_dir
-    tf.gfile.MakeDirs(cache_dir)
-
-  def fetch(self, key, pk3_path):
-    path = os.path.join(self._cache_dir, key)
-    if tf.gfile.Exists(path):
-      tf.gfile.Copy(path, pk3_path, overwrite=True)
-      return True
-    return False
-
-  def write(self, key, pk3_path):
-    path = os.path.join(self._cache_dir, key)
-    if not tf.gfile.Exists(path):
-      tf.gfile.Copy(pk3_path, path)
-
-
 DEFAULT_ACTION_SET = (
-    (0, 0, 0, 1, 0, 0, 0),    # Forward
-    (0, 0, 0, -1, 0, 0, 0),   # Backward
-    (0, 0, -1, 0, 0, 0, 0),   # Strafe Left
-    (0, 0, 1, 0, 0, 0, 0),    # Strafe Right
-    (-20, 0, 0, 0, 0, 0, 0),  # Look Left
-    (20, 0, 0, 0, 0, 0, 0),   # Look Right
-    (-20, 0, 0, 1, 0, 0, 0),  # Look Left + Forward
-    (20, 0, 0, 1, 0, 0, 0),   # Look Right + Forward
-    (0, 0, 0, 0, 1, 0, 0),    # Fire.
+    (0),    # Down
+    (1),    # Up
+    (2),    # Left
+    (3),    # Right
+    (4),    # Use
 )
 
+class PyProcessCraftLab(object):
+  """CraftLab wrapper for PyProcess."""
 
-class PyProcessDmLab(object):
-  """DeepMind Lab wrapper for PyProcess."""
-
-  def __init__(self, level, config, num_action_repeats, seed,
+  def __init__(self, env, config, num_action_repeats=1, seed=0,
                runfiles_path=None, level_cache=None):
+
+    del runfiles_path, level_cache, config
     self._num_action_repeats = num_action_repeats
     self._random_state = np.random.RandomState(seed=seed)
-    if runfiles_path:
-      deepmind_lab.set_runfiles_path(runfiles_path)
-    config = {k: str(v) for k, v in config.iteritems()}
-    self._observation_spec = ['RGB_INTERLEAVED', 'INSTR']
-    self._env = deepmind_lab.Lab(
-        level=level,
-        observations=self._observation_spec,
-        config=config,
-        level_cache=level_cache,
-    )
+    # config = {k: str(v) for k, v in config.iteritems()}
+    self._env = env
+    self._observation_spec = self._env.obs_specs()
 
   def _reset(self):
     self._env.reset(seed=self._random_state.randint(0, 2 ** 31 - 1))
 
   def _observation(self):
-    d = self._env.observations()
-    return [d[k] for k in self._observation_spec]
+    obs = self._env.observations()
+    return self._flatten_obs(obs)
+
+  def _flatten_obs(self, obs):
+    return [obs[k] for k in self._observation_spec]
 
   def initial(self):
-    self._reset()
-    return self._observation()
+    initial_obs = self._reset()
+    return self._flatten_obs(initial_obs)
 
   def step(self, action):
-    reward = self._env.step(action, num_steps=self._num_action_repeats)
-    done = np.array(not self._env.is_running())
+    reward, done, observation = self._env.step(action, num_steps=self._num_action_repeats)
     if done:
+      # check if that's what I want!
       self._reset()
-    observation = self._observation()
-    reward = np.array(reward, dtype=np.float32)
-    return reward, done, observation
+    return reward, done, self._flatten_obs(observation)
 
   def close(self):
     self._env.close()
@@ -107,11 +77,11 @@ class PyProcessDmLab(object):
   @staticmethod
   def _tensor_specs(method_name, unused_kwargs, constructor_kwargs):
     """Returns a nest of `TensorSpec` with the method's output specification."""
-    width = constructor_kwargs['config'].get('width', 320)
-    height = constructor_kwargs['config'].get('height', 240)
-
+    del constructor_kwargs
+    # TODO: hardcoded shapes, fix me!
+    # add to config
     observation_spec = [
-        tf.contrib.framework.TensorSpec([height, width, 3], tf.uint8),
+        tf.contrib.framework.TensorSpec([1076, ], tf.uint8),
         tf.contrib.framework.TensorSpec([], tf.string),
     ]
 

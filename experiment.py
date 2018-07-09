@@ -24,7 +24,7 @@ import functools
 import os
 import sys
 
-import dmlab30
+import jeju_env
 import environments
 import numpy as np
 import py_process
@@ -62,7 +62,7 @@ flags.DEFINE_integer('total_environment_frames', int(1e9),
 flags.DEFINE_integer('num_actors', 4, 'Number of actors.')
 flags.DEFINE_integer('batch_size', 2, 'Batch size for training.')
 flags.DEFINE_integer('unroll_length', 100, 'Unroll length in agent steps.')
-flags.DEFINE_integer('num_action_repeats', 4, 'Number of action repeats.')
+flags.DEFINE_integer('num_action_repeats', 1, 'Number of action repeats.')
 flags.DEFINE_integer('seed', 1, 'Random seed.')
 
 # Loss settings.
@@ -74,14 +74,13 @@ flags.DEFINE_enum('reward_clipping', 'abs_one', ['abs_one', 'soft_asymmetric'],
 
 # Environment settings.
 flags.DEFINE_string(
-    'dataset_path', '',
-    'Path to dataset needed for psychlab_*, see '
-    'https://github.com/deepmind/lab/tree/master/data/brady_konkle_oliva2008')
-flags.DEFINE_string('level_name', 'explore_goal_locations_small',
-                    '''Level name or \'dmlab30\' for the full DmLab-30 suite '''
-                    '''with levels assigned round robin to the actors.''')
-flags.DEFINE_integer('width', 96, 'Width of observation.')
-flags.DEFINE_integer('height', 72, 'Height of observation.')
+    'recepies_path', '',
+    'Path to recepies for craft environment'
+    'resources/recipes.yaml')
+flags.DEFINE_string(
+    'hints_path', '',
+    'Path to hints for craft environment'
+    'resources/hints.yaml')
 
 # Optimizer settings.
 flags.DEFINE_float('learning_rate', 0.00048, 'Learning rate.')
@@ -92,7 +91,7 @@ flags.DEFINE_float('epsilon', .1, 'RMSProp epsilon.')
 
 # Structure to be sent from actors to learner.
 ActorOutput = collections.namedtuple(
-    'ActorOutput', 'level_name agent_state env_outputs agent_outputs')
+    'ActorOutput', 'task_name agent_state env_outputs agent_outputs')
 AgentOutput = collections.namedtuple('AgentOutput',
                                      'action policy_logits baseline')
 
@@ -110,6 +109,7 @@ class Agent(snt.RNNCore):
     self._num_actions = num_actions
 
     with self._enter_variable_scope():
+      # read the model params this from config
       self._core = tf.contrib.rnn.LSTMBlockCell(256)
 
   def initial_state(self, batch_size):
@@ -127,6 +127,7 @@ class Agent(snt.RNNCore):
     buckets = tf.string_to_hash_bucket_fast(dense, num_hash_buckets)
 
     # Embed the instruction. Embedding size 20 seems to be enough.
+    # I can embed the task name
     embedding_size = 20
     embedding = snt.Embed(num_hash_buckets, embedding_size)(buckets)
 
@@ -134,7 +135,7 @@ class Agent(snt.RNNCore):
     padding = tf.to_int32(tf.equal(tf.shape(embedding)[1], 0))
     embedding = tf.pad(embedding, [[0, 0], [0, padding], [0, 0]])
 
-    core = tf.contrib.rnn.LSTMBlockCell(64, name='language_lstm')
+    core = tf.contrib.rnn.LSTMBlockCell(64, name='task_lstm')
     output, _ = tf.nn.dynamic_rnn(core, embedding, length, dtype=tf.float32)
 
     # Return last output.
@@ -142,47 +143,21 @@ class Agent(snt.RNNCore):
 
   def _torso(self, input_):
     last_action, env_output = input_
-    reward, _, _, (frame, instruction) = env_output
+    reward, _, _, (features, task_name) = env_output
 
-    # Convert to floats.
-    frame = tf.to_float(frame)
+    features_out = tf.nn.relu(features)
+    features_out = snt.BatchFlatten()(features_out)
 
-    frame /= 255
-    with tf.variable_scope('convnet'):
-      conv_out = frame
-      for i, (num_ch, num_blocks) in enumerate([(16, 2), (32, 2), (32, 2)]):
-        # Downscale.
-        conv_out = snt.Conv2D(num_ch, 3, stride=1, padding='SAME')(conv_out)
-        conv_out = tf.nn.pool(
-            conv_out,
-            window_shape=[3, 3],
-            pooling_type='MAX',
-            padding='SAME',
-            strides=[2, 2])
+    features_out = snt.Linear(256)(features_out)
+    features_out = tf.nn.relu(features_out)
 
-        # Residual block(s).
-        for j in range(num_blocks):
-          with tf.variable_scope('residual_%d_%d' % (i, j)):
-            block_input = conv_out
-            conv_out = tf.nn.relu(conv_out)
-            conv_out = snt.Conv2D(num_ch, 3, stride=1, padding='SAME')(conv_out)
-            conv_out = tf.nn.relu(conv_out)
-            conv_out = snt.Conv2D(num_ch, 3, stride=1, padding='SAME')(conv_out)
-            conv_out += block_input
-
-    conv_out = tf.nn.relu(conv_out)
-    conv_out = snt.BatchFlatten()(conv_out)
-
-    conv_out = snt.Linear(256)(conv_out)
-    conv_out = tf.nn.relu(conv_out)
-
-    instruction_out = self._instruction(instruction)
+    instruction_out = self._instruction(task_name)
 
     # Append clipped last reward and one hot last action.
     clipped_reward = tf.expand_dims(tf.clip_by_value(reward, -1, 1), -1)
     one_hot_last_action = tf.one_hot(last_action, self._num_actions)
     return tf.concat(
-        [conv_out, clipped_reward, one_hot_last_action, instruction_out],
+        [features_out, clipped_reward, one_hot_last_action, instruction_out],
         axis=1)
 
   def _head(self, core_output):
@@ -225,7 +200,7 @@ class Agent(snt.RNNCore):
     return snt.BatchApply(self._head)(tf.stack(core_output_list)), core_state
 
 
-def build_actor(agent, env, level_name, action_set):
+def build_actor(agent, env, task_name, action_set):
   """Builds the actor loop."""
   # Initial values.
   initial_env_output, initial_env_state = env.initial()
@@ -302,7 +277,7 @@ def build_actor(agent, env, level_name, action_set):
         (first_agent_output, first_env_output), (agent_outputs, env_outputs))
 
     output = ActorOutput(
-        level_name=level_name, agent_state=first_agent_state,
+        task_name=task_name, agent_state=first_agent_state,
         env_outputs=full_env_outputs, agent_outputs=full_agent_outputs)
 
     # No backpropagation should be done here.
@@ -367,6 +342,7 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
   elif FLAGS.reward_clipping == 'soft_asymmetric':
     squeezed = tf.tanh(rewards / 5.0)
     # Negative rewards are given less weight than positive rewards.
+    # we don't have negative rewards so this is redundant
     clipped_rewards = tf.where(rewards < 0, .3 * squeezed, squeezed) * 5.
 
   discounts = tf.to_float(~done) * FLAGS.discounting
@@ -415,27 +391,21 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
   return done, infos, num_env_frames_and_train
 
 
-def create_environment(level_name, seed, is_test=False):
+def create_environment(env_sampler, task_name=None, seed=0, is_test=False):
   """Creates an environment wrapped in a `FlowEnvironment`."""
-  if level_name in dmlab30.ALL_LEVELS:
-    level_name = 'contributed/dmlab30/' + level_name
+  # Sample an environment
+  env = env_sampler.sample_environment(task_name)
+  print("Sampled environment: task: {}: {}".format(env.task_name, env.task))
 
-  # Note, you may want to use a level cache to speed of compilation of
-  # environment maps. See the documentation for the Python interface of DeepMind
-  # Lab.
-  config = {
-      'width': FLAGS.width,
-      'height': FLAGS.height,
-      'datasetPath': FLAGS.dataset_path,
-  }
-  if is_test:
-    config['allowHoldOutLevels'] = 'true'
-    # Mixer seed for evalution, see
-    # https://github.com/deepmind/lab/blob/master/docs/users/python_api.md
-    config['mixerSeed'] = 0x600D5EED
-  p = py_process.PyProcess(environments.PyProcessDmLab, level_name, config,
+  task_name = env.task_name
+
+  # config is empty dict for now
+  config= {}
+  # if is_test:
+      # check the heldout tasks?
+  p = py_process.PyProcess(environments.PyProcessCraftLab, env, config,
                            FLAGS.num_action_repeats, seed)
-  return environments.FlowEnvironment(p.proxy)
+  return environments.FlowEnvironment(p.proxy), task_name
 
 
 @contextlib.contextmanager
@@ -455,7 +425,7 @@ def pin_global_variables(device):
     yield vs
 
 
-def train(action_set, level_names):
+def train(action_set):
   """Train."""
 
   if is_single_machine():
@@ -485,9 +455,20 @@ def train(action_set, level_names):
 
   # Only used to find the actor output structure.
   with tf.Graph().as_default():
+    # here the meta learning algorithm should propose the task
+    # currently it is randomly generated
+    recipes_path = FLAGS.recepies_path
+    hints_path = FLAGS.hints_path
+    # here we could generate  i number of envs for i = len(num_actors)
+    # or alternavtively call env_sampler everytime, env_sampler is gonna be replaced
+    # by a teacher later
+    env_sampler = jeju_env.env_factory.EnvironmentFactory(
+        recipes_path, hints_path, seed=1)
+    task_names = env_sampler.task_names
+    env, _ = create_environment(env_sampler, seed=1)
+
     agent = Agent(len(action_set))
-    env = create_environment(level_names[0], seed=1)
-    structure = build_actor(agent, env, level_names[0], action_set)
+    structure = build_actor(agent, env, None, action_set)
     flattened_structure = nest.flatten(structure)
     dtypes = [t.dtype for t in flattened_structure]
     shapes = [t.shape.as_list() for t in flattened_structure]
@@ -520,10 +501,10 @@ def train(action_set, level_names):
     enqueue_ops = []
     for i in range(FLAGS.num_actors):
       if is_actor_fn(i):
-        level_name = level_names[i % len(level_names)]
-        tf.logging.info('Creating actor %d with level %s', i, level_name)
-        env = create_environment(level_name, seed=i + 1)
-        actor_output = build_actor(agent, env, level_name, action_set)
+        env, task_name = create_environment(env_sampler, seed=i+1)
+        # tf.logging.info('Creating actor %d with level %s', i, level_name)
+        # env = create_environment(level_name, seed=i + 1)
+        actor_output = build_actor(agent, env, task_name, action_set)
         with tf.device(shared_job_device):
           enqueue_ops.append(queue.enqueue(nest.flatten(actor_output)))
 
@@ -587,7 +568,7 @@ def train(action_set, level_names):
 
       if is_learner:
         # Logging.
-        level_returns = {level_name: [] for level_name in level_names}
+        task_returns = {task_name: [] for task_name in task_names}
         summary_writer = tf.summary.FileWriterCache.get(FLAGS.logdir)
 
         # Prepare data for first run.
@@ -597,44 +578,28 @@ def train(action_set, level_names):
         # Execute learning and track performance.
         num_env_frames_v = 0
         while num_env_frames_v < FLAGS.total_environment_frames:
-          level_names_v, done_v, infos_v, num_env_frames_v, _ = session.run(
-              (data_from_actors.level_name,) + output + (stage_op,))
-          level_names_v = np.repeat([level_names_v], done_v.shape[0], 0)
+          task_names_v, done_v, infos_v, num_env_frames_v, _ = session.run(
+              (data_from_actors.task_name,) + output + (stage_op,))
+          task_names_v = np.repeat([task_names_v], done_v.shape[0], 0)
 
-          for level_name, episode_return, episode_step in zip(
-              level_names_v[done_v],
+          for task_name, episode_return, episode_step in zip(
+              task_names_v[done_v],
               infos_v.episode_return[done_v],
               infos_v.episode_step[done_v]):
             episode_frames = episode_step * FLAGS.num_action_repeats
 
-            tf.logging.info('Level: %s Episode return: %f',
-                            level_name, episode_return)
+            tf.logging.info('Task: %s Episode return: %f',
+                            task_name, episode_return)
 
             summary = tf.summary.Summary()
-            summary.value.add(tag=level_name + '/episode_return',
+            summary.value.add(tag=task_name + '/episode_return',
                               simple_value=episode_return)
-            summary.value.add(tag=level_name + '/episode_frames',
+            summary.value.add(tag=task_name + '/episode_frames',
                               simple_value=episode_frames)
             summary_writer.add_summary(summary, num_env_frames_v)
 
-            if FLAGS.level_name == 'dmlab30':
-              level_returns[level_name].append(episode_return)
-
-          if (FLAGS.level_name == 'dmlab30' and
-              min(map(len, level_returns.values())) >= 1):
-            no_cap = dmlab30.compute_human_normalized_score(level_returns,
-                                                            per_level_cap=None)
-            cap_100 = dmlab30.compute_human_normalized_score(level_returns,
-                                                             per_level_cap=100)
-            summary = tf.summary.Summary()
-            summary.value.add(
-                tag='dmlab30/training_no_cap', simple_value=no_cap)
-            summary.value.add(
-                tag='dmlab30/training_cap_100', simple_value=cap_100)
-            summary_writer.add_summary(summary, num_env_frames_v)
-
             # Clear level scores.
-            level_returns = {level_name: [] for level_name in level_names}
+            task_returns = {task_name: [] for task_name in task_names}
 
       else:
         # Execute actors (they just need to enqueue their output).
@@ -642,57 +607,52 @@ def train(action_set, level_names):
           session.run(enqueue_ops)
 
 
-def test(action_set, level_names):
+def test(action_set):
   """Test."""
-
-  level_returns = {level_name: [] for level_name in level_names}
   with tf.Graph().as_default():
+    # Get EnvironmentFactory
+    recipes_path = FLAGS.recepies_path
+    hints_path = FLAGS.hints_path
+    env_sampler = jeju_env.env_factory.EnvironmentFactory(
+        recipes_path, hints_path, seed=1)
+    task_names = env_sampler.task_names
+
     agent = Agent(len(action_set))
     outputs = {}
-    for level_name in level_names:
-      env = create_environment(level_name, seed=1, is_test=True)
-      outputs[level_name] = build_actor(agent, env, level_name, action_set)
+    task_returns = {task_name: [] for task_name in task_names}
+
+    # this is good as we want to test on all environments
+    # so I def need a list of tasks
+    for task_name in task_names:
+      env, _ = create_environment(env_sampler, task_name=task_name, seed=1, is_test=True)
+      outputs[task_name] = build_actor(agent, env, task_name, action_set)
 
     with tf.train.SingularMonitoredSession(
         checkpoint_dir=FLAGS.logdir,
         hooks=[py_process.PyProcessHook()]) as session:
-      for level_name in level_names:
-        tf.logging.info('Testing level: %s', level_name)
+      for task_name in task_names:
+        tf.logging.info('Testing task: %s', task_name)
         while True:
           done_v, infos_v = session.run((
-              outputs[level_name].env_outputs.done,
-              outputs[level_name].env_outputs.info
+              outputs[task_name].env_outputs.done,
+              outputs[task_name].env_outputs.info
           ))
-          returns = level_returns[level_name]
+          returns = task_returns[task_name]
           returns.extend(infos_v.episode_return[1:][done_v[1:]])
 
           if len(returns) >= FLAGS.test_num_episodes:
             tf.logging.info('Mean episode return: %f', np.mean(returns))
             break
 
-  if FLAGS.level_name == 'dmlab30':
-    no_cap = dmlab30.compute_human_normalized_score(level_returns,
-                                                    per_level_cap=None)
-    cap_100 = dmlab30.compute_human_normalized_score(level_returns,
-                                                     per_level_cap=100)
-    tf.logging.info('No cap.: %f Cap 100: %f', no_cap, cap_100)
-
 
 def main(_):
   tf.logging.set_verbosity(tf.logging.INFO)
 
   action_set = environments.DEFAULT_ACTION_SET
-  if FLAGS.level_name == 'dmlab30' and FLAGS.mode == 'train':
-    level_names = dmlab30.LEVEL_MAPPING.keys()
-  elif FLAGS.level_name == 'dmlab30' and FLAGS.mode == 'test':
-    level_names = dmlab30.LEVEL_MAPPING.values()
-  else:
-    level_names = [FLAGS.level_name]
-
   if FLAGS.mode == 'train':
-    train(action_set, level_names)
+    train(action_set)
   else:
-    test(action_set, level_names)
+    test(action_set)
 
 
 if __name__ == '__main__':
