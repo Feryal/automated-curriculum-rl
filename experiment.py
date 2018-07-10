@@ -246,6 +246,10 @@ def build_actor(agent, env, task_name, action_set):
   first_values = nest.map_structure(lambda v: v.read_value(), persistent_state)
   _, first_env_output, first_agent_state, first_agent_output = first_values
 
+  # TODO Useful for debugging I think, single agent step
+  # output = step(first_values, 0)
+  # _, env_outputs, _, agent_outputs = output
+
   # Use scan to apply `step` multiple times, therefore unrolling the agent
   # and environment interaction for `FLAGS.unroll_length`. `tf.scan` forwards
   # the output of each call of `step` as input of the subsequent call of `step`.
@@ -403,7 +407,16 @@ def create_environment(env_sampler, task_name=None, seed=0, is_test=False):
       # check the heldout tasks?
   p = py_process.PyProcess(environments.PyProcessCraftLab, env, config,
                            FLAGS.num_action_repeats, seed)
-  return environments.FlowEnvironment(p.proxy), task_name
+
+  flow_env = environments.FlowEnvironment(p.proxy)
+
+  # TODO clean me up, useful for debugging
+  # obs_reset = p.proxy.initial()
+  # rew, done, obs_step = p.proxy.step(0)
+  # output_initial, state_initial = flow_env.initial()
+  # output_step, state_step = flow_env.step(0, state_initial)
+
+  return flow_env, task_name
 
 
 @contextlib.contextmanager
