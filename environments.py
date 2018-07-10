@@ -24,8 +24,6 @@ import os.path
 import numpy as np
 import tensorflow as tf
 
-import jeju_env
-
 
 nest = tf.contrib.framework.nest
 
@@ -51,7 +49,7 @@ class PyProcessCraftLab(object):
     self._observation_spec = self._env.obs_specs()
 
   def _reset(self):
-    self._env.reset(seed=self._random_state.randint(0, 2 ** 31 - 1))
+    return self._env.reset(seed=self._random_state.randint(0, 2 ** 31 - 1))
 
   def _observation(self):
     obs = self._env.observations()
@@ -81,7 +79,7 @@ class PyProcessCraftLab(object):
     # TODO: hardcoded shapes, fix me!
     # add to config
     observation_spec = [
-        tf.contrib.framework.TensorSpec([1076, ], tf.uint8),
+        tf.contrib.framework.TensorSpec([1076, ], tf.float32),
         tf.contrib.framework.TensorSpec([], tf.string),
     ]
 
@@ -132,8 +130,8 @@ class FlowEnvironment(object):
       reward/transition type that lead to the observation in `StepOutput`.
     """
     with tf.name_scope('flow_environment_initial'):
-      initial_reward = tf.constant(0.)
-      initial_info = StepOutputInfo(tf.constant(0.), tf.constant(0))
+      initial_reward = tf.constant(0., dtype=tf.float32)
+      initial_info = StepOutputInfo(tf.constant(0., dtype=tf.float32), tf.constant(0))
       initial_done = tf.constant(True)
       initial_observation = self._env.initial()
 
@@ -146,7 +144,7 @@ class FlowEnvironment(object):
       # Control dependency to make sure the next step can't be taken before the
       # initial output has been read from the environment.
       with tf.control_dependencies(nest.flatten(initial_output)):
-        initial_flow = tf.constant(0, dtype=tf.int64)
+        initial_flow = tf.constant(0., dtype=tf.float32)
       initial_state = (initial_flow, initial_info)
       return initial_output, initial_state
 
@@ -181,7 +179,7 @@ class FlowEnvironment(object):
                                 info.episode_step + 1)
       new_state = new_flow, nest.map_structure(
           lambda a, b: tf.where(done, a, b),
-          StepOutputInfo(tf.constant(0.), tf.constant(0)),
+          StepOutputInfo(tf.constant(0., dtype=tf.float32), tf.constant(0)),
           new_info)
 
       output = StepOutput(reward, new_info, done, observation)

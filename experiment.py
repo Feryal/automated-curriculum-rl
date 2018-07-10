@@ -24,7 +24,7 @@ import functools
 import os
 import sys
 
-import jeju_env
+from jeju_env import env_factory
 import environments
 import numpy as np
 import py_process
@@ -74,13 +74,11 @@ flags.DEFINE_enum('reward_clipping', 'abs_one', ['abs_one', 'soft_asymmetric'],
 
 # Environment settings.
 flags.DEFINE_string(
-    'recepies_path', '',
-    'Path to recepies for craft environment'
-    'resources/recipes.yaml')
+    'recepies_path', 'jeju_env/resources/recipes.yaml',
+    'Path to recepies for craft environment')
 flags.DEFINE_string(
-    'hints_path', '',
-    'Path to hints for craft environment'
-    'resources/hints.yaml')
+    'hints_path', 'jeju_env/resources/hints.yaml',
+    'Path to hints for craft environment')
 
 # Optimizer settings.
 flags.DEFINE_float('learning_rate', 0.00048, 'Learning rate.')
@@ -151,13 +149,13 @@ class Agent(snt.RNNCore):
     features_out = snt.Linear(256)(features_out)
     features_out = tf.nn.relu(features_out)
 
-    instruction_out = self._instruction(task_name)
+    # instruction_out = self._instruction(task_name)
 
     # Append clipped last reward and one hot last action.
     clipped_reward = tf.expand_dims(tf.clip_by_value(reward, -1, 1), -1)
     one_hot_last_action = tf.one_hot(last_action, self._num_actions)
     return tf.concat(
-        [features_out, clipped_reward, one_hot_last_action, instruction_out],
+        [features_out, clipped_reward, one_hot_last_action],
         axis=1)
 
   def _head(self, core_output):
@@ -462,13 +460,13 @@ def train(action_set):
     # here we could generate  i number of envs for i = len(num_actors)
     # or alternavtively call env_sampler everytime, env_sampler is gonna be replaced
     # by a teacher later
-    env_sampler = jeju_env.env_factory.EnvironmentFactory(
+    env_sampler = env_factory.EnvironmentFactory(
         recipes_path, hints_path, seed=1)
     task_names = env_sampler.task_names
     env, _ = create_environment(env_sampler, seed=1)
 
     agent = Agent(len(action_set))
-    structure = build_actor(agent, env, None, action_set)
+    structure = build_actor(agent, env, '', action_set)
     flattened_structure = nest.flatten(structure)
     dtypes = [t.dtype for t in flattened_structure]
     shapes = [t.shape.as_list() for t in flattened_structure]
@@ -613,7 +611,7 @@ def test(action_set):
     # Get EnvironmentFactory
     recipes_path = FLAGS.recepies_path
     hints_path = FLAGS.hints_path
-    env_sampler = jeju_env.env_factory.EnvironmentFactory(
+    env_sampler = env_factory.EnvironmentFactory(
         recipes_path, hints_path, seed=1)
     task_names = env_sampler.task_names
 
