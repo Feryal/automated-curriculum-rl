@@ -630,7 +630,7 @@ def train(action_set):
 
       if is_learner:
         # Logging.
-        task_returns = collections.defaultdict(lambda: collections.deque((), 100))
+        task_returns = collections.defaultdict(lambda: collections.deque((), 10))
         summary_writer = tf.summary.FileWriterCache.get(FLAGS.logdir)
 
         # Prepare data for first run.
@@ -661,6 +661,8 @@ def train(action_set):
                               simple_value=episode_return)
             summary.value.add(tag=task_name + '/episode_frames',
                               simple_value=episode_frames)
+            summary.value.add(tag=task_name + '/mean_episode_return',
+                              simple_value=np.mean(task_returns[task_name]))
             summary_writer.add_summary(summary, num_env_frames_v)
 
           for task_name in task_names:
