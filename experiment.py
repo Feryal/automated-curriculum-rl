@@ -74,11 +74,20 @@ flags.DEFINE_enum('reward_clipping', 'abs_one', ['abs_one', 'soft_asymmetric'],
 
 # Environment settings.
 flags.DEFINE_string(
-    'recepies_path', 'craft_env/resources/recipes.yaml',
-    'Path to recepies for craft environment')
+    'recipes_path', 'craft_env/resources/recipes.yaml',
+    'Path to recipes for craft environment')
 flags.DEFINE_string(
     'hints_path', 'craft_env/resources/hints.yaml',
     'Path to hints for craft environment')
+flags.DEFINE_integer(
+    'max_steps', 200,
+    'Maximum number of steps before the environment terminates on a failure.')
+
+# Curriculum settings.
+flags.DEFINE_integer(
+    'switch_tasks_every_k_frames', int(1e4),
+    'We will trigger a refresh of the tasks after K environment frames.'
+)
 
 # Optimizer settings.
 flags.DEFINE_float('learning_rate', 0.00048, 'Learning rate.')
@@ -222,11 +231,11 @@ def build_actor(agent, env, task_name_op, action_set):
 
   persistent_state = nest.map_structure(
       create_state, (initial_env_state, initial_env_output, initial_agent_state,
-                     initial_agent_output, task_name_op))
+                     initial_agent_output))
 
   def step(input_, unused_i):
     """Steps through the agent and the environment."""
-    env_state, env_output, agent_state, agent_output, task_name = input_
+    env_state, env_output, agent_state, agent_output = input_
 
     # Run agent.
     action = agent_output[0]
@@ -239,14 +248,14 @@ def build_actor(agent, env, task_name_op, action_set):
     action = agent_output[0][0]
     raw_action = tf.gather(action_set, action)
 
-    env_output, env_state = env.step(raw_action, env_state, task_name)
+    env_output, env_state = env.step(raw_action, env_state, task_name_op)
 
-    return env_state, env_output, agent_state, agent_output, task_name
+    return env_state, env_output, agent_state, agent_output
 
   # Run the unroll. `read_value()` is needed to make sure later usage will
   # return the first values and not a new snapshot of the variables.
   first_values = nest.map_structure(lambda v: v.read_value(), persistent_state)
-  _, first_env_output, first_agent_state, first_agent_output, first_task_name = first_values
+  _, first_env_output, first_agent_state, first_agent_output = first_values
 
   # TODO Useful for debugging I think, single agent step
   # output = step(first_values, 0)
@@ -261,7 +270,7 @@ def build_actor(agent, env, task_name_op, action_set):
   # unroll. Note that the initial states and outputs (fed through `initializer`)
   # are not in `output` and will need to be added manually later.
   output = tf.scan(step, tf.range(FLAGS.unroll_length), first_values)
-  _, env_outputs, _, agent_outputs, task_name = output
+  _, env_outputs, _, agent_outputs = output
 
   # Update persistent state with the last output from the loop.
   assign_ops = nest.map_structure(lambda v, t: v.assign(t[-1]),
@@ -277,13 +286,13 @@ def build_actor(agent, env, task_name_op, action_set):
     # task_name = nest.map_structure(lambda t: t[0], task_name)
 
     # Concatenate first output and the unroll along the time dimension.
-    full_agent_outputs, full_env_outputs, full_task_name = nest.map_structure(
+    full_agent_outputs, full_env_outputs = nest.map_structure(
         lambda first, rest: tf.concat([[first], rest], 0),
-        (first_agent_output, first_env_output, first_task_name),
-        (agent_outputs, env_outputs, task_name))
+        (first_agent_output, first_env_output),
+        (agent_outputs, env_outputs))
 
     actor_output = ActorOutput(
-        task_name=full_task_name, agent_state=first_agent_state,
+        task_name=task_name_op, agent_state=first_agent_state,
         env_outputs=full_env_outputs, agent_outputs=full_agent_outputs)
 
     # No backpropagation should be done here.
@@ -421,6 +430,16 @@ def create_environment(env_sampler, initial_task_name=None, seed=0, is_test=Fals
   return flow_env
 
 
+def update_all_actors_tasks(new_tasks_assignments, actor_task_name_params, session):
+  feed_dict = {}
+  for actor_i in range(FLAGS.num_actors):
+    actor_task_name_params['task_name'][actor_i] = new_tasks_assignments[actor_i]
+    feed_dict[actor_task_name_params['ph']
+              [actor_i]] = new_tasks_assignments[actor_i]
+  # Update tasks for all actors
+  session.run(actor_task_name_params['update'], feed_dict=feed_dict)
+
+
 @contextlib.contextmanager
 def pin_global_variables(device):
   """Pins global variables to the specified device."""
@@ -472,13 +491,12 @@ def train(action_set):
   with tf.Graph().as_default():
     # here the meta learning algorithm should propose the task
     # currently it is randomly generated
-    recipes_path = FLAGS.recepies_path
-    hints_path = FLAGS.hints_path
+
     # here we could generate  i number of envs for i = len(num_actors)
     # or alternavtively call env_sampler everytime, env_sampler is gonna be replaced
     # by a teacher later
     env_sampler = env_factory.EnvironmentFactory(
-        recipes_path, hints_path, seed=1)
+        FLAGS.recipes_path, FLAGS.hints_path, max_steps=FLAGS.max_steps, seed=1)
     env = create_environment(env_sampler, seed=1)
 
     agent = Agent(len(action_set))
@@ -499,13 +517,31 @@ def train(action_set):
 
       # Setup the task names variables and assignment logic
       task_names = env_sampler.task_names
-      actor_task_name_vars = []
+      actor_task_name_params = collections.defaultdict(list)
       for actor_i in range(FLAGS.num_actors):
+        # Assign initial task name by round-robin
         initial_task_name = task_names[actor_i % len(task_names)]
-        actor_task_name_var = tf.constant(
-            initial_task_name, dtype=tf.string, shape=(),
-            name="initial_task_actor_{}".format(i))
-        actor_task_name_vars.append(actor_task_name_var)
+
+        # Setup variables and assignment logic
+        actor_task_name_var = tf.get_variable(
+            "task_name_actor_{}".format(actor_i),
+            shape=(),
+            dtype=tf.string,
+            initializer=tf.constant_initializer(
+                initial_task_name, dtype=tf.string),
+            trainable=False,
+            collections=[tf.GraphKeys.GLOBAL_VARIABLES]
+        )
+        actor_task_name_ph = tf.placeholder(
+            dtype=tf.string, shape=(), name='actor_{}_new_task_name'.format(actor_i))
+        assign_actor_task_name = tf.assign(
+            actor_task_name_var, actor_task_name_ph,
+            name='update_task_name_actor_{}'.format(actor_i))
+
+        actor_task_name_params['task_name'].append(initial_task_name)
+        actor_task_name_params['var'].append(actor_task_name_var)
+        actor_task_name_params['ph'].append(actor_task_name_ph)
+        actor_task_name_params['update'].append(assign_actor_task_name)
 
       if is_single_machine() and 'dynamic_batching' in sys.modules:
         # For single machine training, we use dynamic batching for improved GPU
@@ -524,13 +560,13 @@ def train(action_set):
 
     # Build actors and ops to enqueue their output.
     enqueue_ops = []
-    for i in range(FLAGS.num_actors):
-      if is_actor_fn(i):
-        env = create_environment(env_sampler, seed=i+1)
+    for actor_i in range(FLAGS.num_actors):
+      if is_actor_fn(actor_i):
+        env = create_environment(env_sampler, seed=actor_i+1)
         tf.logging.info('Creating actor %d with level %s',
-                        i, actor_task_name_vars[i])
+                        actor_i, actor_task_name_params['task_name'][actor_i])
         actor_output = build_actor(
-            agent, env, actor_task_name_vars[i], action_set)
+            agent, env, actor_task_name_params['var'][actor_i].read_value(), action_set)
         with tf.device(shared_job_device):
           enqueue_ops.append(queue.enqueue(nest.flatten(actor_output)))
 
@@ -594,7 +630,7 @@ def train(action_set):
 
       if is_learner:
         # Logging.
-        task_returns = collections.defaultdict(list)
+        task_returns = collections.defaultdict(lambda: collections.deque((), 100))
         summary_writer = tf.summary.FileWriterCache.get(FLAGS.logdir)
 
         # Prepare data for first run.
@@ -603,6 +639,8 @@ def train(action_set):
 
         # Execute learning and track performance.
         num_env_frames_v = 0
+        next_task_switch_at = FLAGS.switch_tasks_every_k_frames
+
         while num_env_frames_v < FLAGS.total_environment_frames:
           task_names_v, done_v, infos_v, num_env_frames_v, _ = session.run(
               (data_from_actors.task_name,) + output + (stage_op,))
@@ -614,8 +652,8 @@ def train(action_set):
                   infos_v.episode_step[done_v]):
             episode_frames = episode_step * FLAGS.num_action_repeats
 
-            tf.logging.info('Task: %s Episode return: %f',
-                            task_name, episode_return)
+            # tf.logging.info('Task: %s Episode return: %f',
+            # task_name, episode_return)
             task_returns[task_name].append(episode_return)
 
             summary = tf.summary.Summary()
@@ -625,11 +663,26 @@ def train(action_set):
                               simple_value=episode_frames)
             summary_writer.add_summary(summary, num_env_frames_v)
 
-          # Clear level scores.
-          task_returns = {task_name: [] for task_name in task_names}
+          for task_name in task_names:
+            tf.logging.info("[%d] Task: %s, Episode return mean: %f",
+                            num_env_frames_v,
+                            task_name,
+                            np.mean(task_returns[task_name]))
+          # Now update the task_names per actor, rolling fashion
+          if num_env_frames_v >= next_task_switch_at:
+            print("Let's update the tasks for all actors now!")
+            print(task_names)
+            print(actor_task_name_params['task_name'])
 
-          # Now update the task_names per actor
+            # Random assignment
+            actor_task_assignments = np.random.choice(
+                task_names, FLAGS.num_actors, replace=FLAGS.num_actors > len(task_names))
+            update_all_actors_tasks(
+                actor_task_assignments, actor_task_name_params, session)
 
+            next_task_switch_at += FLAGS.switch_tasks_every_k_frames
+
+            print("done! next update at {}".format(next_task_switch_at))
       else:
         # Execute actors (they just need to enqueue their output).
         while True:
@@ -640,10 +693,8 @@ def test(action_set):
   """Test."""
   with tf.Graph().as_default():
     # Get EnvironmentFactory
-    recipes_path = FLAGS.recepies_path
-    hints_path = FLAGS.hints_path
     env_sampler = env_factory.EnvironmentFactory(
-        recipes_path, hints_path, seed=1)
+        FLAGS.recipes_path, FLAGS.hints_path, max_steps=FLAGS.max_steps, seed=1)
 
     task_names = env_sampler.task_names
     task_names_ops = [tf.constant(task_name, dtype=tf.string)

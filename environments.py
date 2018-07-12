@@ -55,8 +55,8 @@ class PyProcessCraftLab(object):
   def _reset(self):
     """Sample a new environment to behave in."""
     self._env = self._env_sampler.sample_environment(self._task_name)
-    print("Reset environment: task: {}: {}".format(
-        self._env.task_name, self._env.task))
+    # print("Reset environment: task: {}: {}".format(
+    #    self._env.task_name, self._env.task))
     return self._env.reset(seed=self._random_state.randint(0, 2 ** 31 - 1))
 
   def _observation(self):
@@ -74,8 +74,7 @@ class PyProcessCraftLab(object):
     reward, done, observation = self._env.step(
         action, num_steps=self._num_action_repeats)
     if done:
-      # check if that's what I want!
-      # Change environment if needed
+      # This will resample an environment according to the new task.
       self._task_name = task_name
       self._reset()
     return reward, done, self._flatten_obs(observation)
@@ -102,28 +101,6 @@ class PyProcessCraftLab(object):
           tf.contrib.framework.TensorSpec([], tf.bool),
           observation_spec,
       )
-
-
-class SwitchCraftEnv(object):
-  """A TF environment wrapper that can change its environment if necessary.
-  """
-
-  def __init__(self, env):
-    """"""
-    self._env = env
-
-  def initial(self):
-    return self._env.initial()
-
-  def step(self, action):
-    reward, done, observation = self._env.step(action)
-
-    # Maybe reload
-    maybe_reload_op = tf.cond(done == true)
-    # Create environment with self.current_name
-
-    with tf.control_dependencies([maybe_reload_op]):
-      return reward, done, observation
 
 
 StepOutputInfo = collections.namedtuple('StepOutputInfo',
