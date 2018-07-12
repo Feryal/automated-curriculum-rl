@@ -24,7 +24,7 @@ import functools
 import os
 import sys
 
-from jeju_env import env_factory
+from craft_env import env_factory
 import environments
 import numpy as np
 import py_process
@@ -74,10 +74,10 @@ flags.DEFINE_enum('reward_clipping', 'abs_one', ['abs_one', 'soft_asymmetric'],
 
 # Environment settings.
 flags.DEFINE_string(
-    'recepies_path', 'jeju_env/resources/recipes.yaml',
+    'recepies_path', 'craft_env/resources/recipes.yaml',
     'Path to recepies for craft environment')
 flags.DEFINE_string(
-    'hints_path', 'jeju_env/resources/hints.yaml',
+    'hints_path', 'craft_env/resources/hints.yaml',
     'Path to hints for craft environment')
 
 # Optimizer settings.

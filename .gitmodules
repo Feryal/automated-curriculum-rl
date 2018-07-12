@@ -1,0 +1,3 @@
+[submodule "craft_env"]
+	path = craft_env
+	url = git@github.com:Feryal/craft_env.git
