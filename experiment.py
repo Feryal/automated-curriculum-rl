@@ -186,7 +186,8 @@ class Agent(snt.RNNCore):
     # Note, in this implementation we can't use CuDNN RNN to speed things up due
     # to the state reset. This can be XLA-compiled (LSTMBlockCell needs to be
     # changed to implement snt.LSTMCell).
-    initial_core_state = self._core.zero_state(tf.shape(actions)[1], tf.float32)
+    initial_core_state = self._core.zero_state(
+        tf.shape(actions)[1], tf.float32)
     core_output_list = []
     for input_, d in zip(tf.unstack(torso_outputs), tf.unstack(done)):
       # If the episode ended, the core state should be reset before the next.
@@ -198,7 +199,7 @@ class Agent(snt.RNNCore):
     return snt.BatchApply(self._head)(tf.stack(core_output_list)), core_state
 
 
-def build_actor(agent, env, task_name, action_set):
+def build_actor(agent, env, task_name_op, action_set):
   """Builds the actor loop."""
   # Initial values.
   initial_env_output, initial_env_state = env.initial()
@@ -221,30 +222,31 @@ def build_actor(agent, env, task_name, action_set):
 
   persistent_state = nest.map_structure(
       create_state, (initial_env_state, initial_env_output, initial_agent_state,
-                     initial_agent_output))
+                     initial_agent_output, task_name_op))
 
   def step(input_, unused_i):
     """Steps through the agent and the environment."""
-    env_state, env_output, agent_state, agent_output = input_
+    env_state, env_output, agent_state, agent_output, task_name = input_
 
     # Run agent.
     action = agent_output[0]
     batched_env_output = nest.map_structure(lambda t: tf.expand_dims(t, 0),
                                             env_output)
-    agent_output, agent_state = agent((action, batched_env_output), agent_state)
+    agent_output, agent_state = agent(
+        (action, batched_env_output), agent_state)
 
     # Convert action index to the native action.
     action = agent_output[0][0]
     raw_action = tf.gather(action_set, action)
 
-    env_output, env_state = env.step(raw_action, env_state)
+    env_output, env_state = env.step(raw_action, env_state, task_name)
 
-    return env_state, env_output, agent_state, agent_output
+    return env_state, env_output, agent_state, agent_output, task_name
 
   # Run the unroll. `read_value()` is needed to make sure later usage will
   # return the first values and not a new snapshot of the variables.
   first_values = nest.map_structure(lambda v: v.read_value(), persistent_state)
-  _, first_env_output, first_agent_state, first_agent_output = first_values
+  _, first_env_output, first_agent_state, first_agent_output, first_task_name = first_values
 
   # TODO Useful for debugging I think, single agent step
   # output = step(first_values, 0)
@@ -259,7 +261,7 @@ def build_actor(agent, env, task_name, action_set):
   # unroll. Note that the initial states and outputs (fed through `initializer`)
   # are not in `output` and will need to be added manually later.
   output = tf.scan(step, tf.range(FLAGS.unroll_length), first_values)
-  _, env_outputs, _, agent_outputs = output
+  _, env_outputs, _, agent_outputs, task_name = output
 
   # Update persistent state with the last output from the loop.
   assign_ops = nest.map_structure(lambda v, t: v.assign(t[-1]),
@@ -272,18 +274,20 @@ def build_actor(agent, env, task_name, action_set):
     first_agent_state = nest.map_structure(lambda t: t[0], first_agent_state)
     first_agent_output = nest.map_structure(lambda t: t[0], first_agent_output)
     agent_outputs = nest.map_structure(lambda t: t[:, 0], agent_outputs)
+    # task_name = nest.map_structure(lambda t: t[0], task_name)
 
     # Concatenate first output and the unroll along the time dimension.
-    full_agent_outputs, full_env_outputs = nest.map_structure(
+    full_agent_outputs, full_env_outputs, full_task_name = nest.map_structure(
         lambda first, rest: tf.concat([[first], rest], 0),
-        (first_agent_output, first_env_output), (agent_outputs, env_outputs))
+        (first_agent_output, first_env_output, first_task_name),
+        (agent_outputs, env_outputs, task_name))
 
-    output = ActorOutput(
-        task_name=task_name, agent_state=first_agent_state,
+    actor_output = ActorOutput(
+        task_name=full_task_name, agent_state=first_agent_state,
         env_outputs=full_env_outputs, agent_outputs=full_agent_outputs)
 
     # No backpropagation should be done here.
-    return nest.map_structure(tf.stop_gradient, output)
+    return nest.map_structure(tf.stop_gradient, actor_output)
 
 
 def compute_baseline_loss(advantages):
@@ -393,19 +397,17 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
   return done, infos, num_env_frames_and_train
 
 
-def create_environment(env_sampler, task_name=None, seed=0, is_test=False):
+def create_environment(env_sampler, initial_task_name=None, seed=0, is_test=False):
   """Creates an environment wrapped in a `FlowEnvironment`."""
-  # Sample an environment
-  env = env_sampler.sample_environment(task_name)
-  print("Sampled environment: task: {}: {}".format(env.task_name, env.task))
-
-  task_name = env.task_name
-
+  # Sample a task if not provided
+  if initial_task_name is None:
+    initial_task_name = np.random.choice(env_sampler.task_names)
   # config is empty dict for now
-  config= {}
+  config = {}
   # if is_test:
-      # check the heldout tasks?
-  p = py_process.PyProcess(environments.PyProcessCraftLab, env, config,
+  # check the heldout tasks?
+  p = py_process.PyProcess(environments.PyProcessCraftLab, env_sampler,
+                           initial_task_name, config,
                            FLAGS.num_action_repeats, seed)
 
   flow_env = environments.FlowEnvironment(p.proxy)
@@ -416,7 +418,7 @@ def create_environment(env_sampler, task_name=None, seed=0, is_test=False):
   # output_initial, state_initial = flow_env.initial()
   # output_step, state_step = flow_env.step(0, state_initial)
 
-  return flow_env, task_name
+  return flow_env
 
 
 @contextlib.contextmanager
@@ -442,7 +444,8 @@ def train(action_set):
   if is_single_machine():
     local_job_device = ''
     shared_job_device = ''
-    is_actor_fn = lambda i: True
+
+    def is_actor_fn(i): return True
     is_learner = True
     global_variable_device = '/gpu'
     server = tf.train.Server.create_local_server()
@@ -450,7 +453,8 @@ def train(action_set):
   else:
     local_job_device = '/job:%s/task:%d' % (FLAGS.job_name, FLAGS.task)
     shared_job_device = '/job:learner/task:0'
-    is_actor_fn = lambda i: FLAGS.job_name == 'actor' and i == FLAGS.task
+
+    def is_actor_fn(i): return FLAGS.job_name == 'actor' and i == FLAGS.task
     is_learner = FLAGS.job_name == 'learner'
 
     # Placing the variable on CPU, makes it cheaper to send it to all the
@@ -475,8 +479,7 @@ def train(action_set):
     # by a teacher later
     env_sampler = env_factory.EnvironmentFactory(
         recipes_path, hints_path, seed=1)
-    task_names = env_sampler.task_names
-    env, _ = create_environment(env_sampler, seed=1)
+    env = create_environment(env_sampler, seed=1)
 
     agent = Agent(len(action_set))
     structure = build_actor(agent, env, '', action_set)
@@ -485,14 +488,24 @@ def train(action_set):
     shapes = [t.shape.as_list() for t in flattened_structure]
 
   with tf.Graph().as_default(), \
-       tf.device(local_job_device + '/cpu'), \
-       pin_global_variables(global_variable_device):
+          tf.device(local_job_device + '/cpu'), \
+          pin_global_variables(global_variable_device):
     tf.set_random_seed(FLAGS.seed)  # Makes initialization deterministic.
 
     # Create Queue and Agent on the learner.
     with tf.device(shared_job_device):
       queue = tf.FIFOQueue(1, dtypes, shapes, shared_name='buffer')
       agent = Agent(len(action_set))
+
+      # Setup the task names variables and assignment logic
+      task_names = env_sampler.task_names
+      actor_task_name_vars = []
+      for actor_i in range(FLAGS.num_actors):
+        initial_task_name = task_names[actor_i % len(task_names)]
+        actor_task_name_var = tf.constant(
+            initial_task_name, dtype=tf.string, shape=(),
+            name="initial_task_actor_{}".format(i))
+        actor_task_name_vars.append(actor_task_name_var)
 
       if is_single_machine() and 'dynamic_batching' in sys.modules:
         # For single machine training, we use dynamic batching for improved GPU
@@ -501,6 +514,7 @@ def train(action_set):
         # of an environment, the actions may be computed using different weights
         # if an update happens within the unroll.
         old_build = agent._build
+
         @dynamic_batching.batch_fn
         def build(*args):
           with tf.device('/gpu'):
@@ -512,10 +526,11 @@ def train(action_set):
     enqueue_ops = []
     for i in range(FLAGS.num_actors):
       if is_actor_fn(i):
-        env, task_name = create_environment(env_sampler, seed=i+1)
-        # tf.logging.info('Creating actor %d with level %s', i, level_name)
-        # env = create_environment(level_name, seed=i + 1)
-        actor_output = build_actor(agent, env, task_name, action_set)
+        env = create_environment(env_sampler, seed=i+1)
+        tf.logging.info('Creating actor %d with level %s',
+                        i, actor_task_name_vars[i])
+        actor_output = build_actor(
+            agent, env, actor_task_name_vars[i], action_set)
         with tf.device(shared_job_device):
           enqueue_ops.append(queue.enqueue(nest.flatten(actor_output)))
 
@@ -568,18 +583,18 @@ def train(action_set):
     tf.logging.info('Creating MonitoredSession, is_chief %s', is_learner)
     config = tf.ConfigProto(allow_soft_placement=True, device_filters=filters)
     with tf.train.MonitoredTrainingSession(
-        server.target,
-        is_chief=is_learner,
-        checkpoint_dir=FLAGS.logdir,
-        save_checkpoint_secs=600,
-        save_summaries_secs=30,
-        log_step_count_steps=50000,
-        config=config,
-        hooks=[py_process.PyProcessHook()]) as session:
+            server.target,
+            is_chief=is_learner,
+            checkpoint_dir=FLAGS.logdir,
+            save_checkpoint_secs=600,
+            save_summaries_secs=30,
+            log_step_count_steps=50000,
+            config=config,
+            hooks=[py_process.PyProcessHook()]) as session:
 
       if is_learner:
         # Logging.
-        task_returns = {task_name: [] for task_name in task_names}
+        task_returns = collections.defaultdict(list)
         summary_writer = tf.summary.FileWriterCache.get(FLAGS.logdir)
 
         # Prepare data for first run.
@@ -594,13 +609,14 @@ def train(action_set):
           task_names_v = np.repeat([task_names_v], done_v.shape[0], 0)
 
           for task_name, episode_return, episode_step in zip(
-              task_names_v[done_v],
-              infos_v.episode_return[done_v],
-              infos_v.episode_step[done_v]):
+                  task_names_v[done_v],
+                  infos_v.episode_return[done_v],
+                  infos_v.episode_step[done_v]):
             episode_frames = episode_step * FLAGS.num_action_repeats
 
             tf.logging.info('Task: %s Episode return: %f',
                             task_name, episode_return)
+            task_returns[task_name].append(episode_return)
 
             summary = tf.summary.Summary()
             summary.value.add(tag=task_name + '/episode_return',
@@ -609,8 +625,10 @@ def train(action_set):
                               simple_value=episode_frames)
             summary_writer.add_summary(summary, num_env_frames_v)
 
-            # Clear level scores.
-            task_returns = {task_name: [] for task_name in task_names}
+          # Clear level scores.
+          task_returns = {task_name: [] for task_name in task_names}
+
+          # Now update the task_names per actor
 
       else:
         # Execute actors (they just need to enqueue their output).
@@ -626,21 +644,26 @@ def test(action_set):
     hints_path = FLAGS.hints_path
     env_sampler = env_factory.EnvironmentFactory(
         recipes_path, hints_path, seed=1)
+
     task_names = env_sampler.task_names
+    task_names_ops = [tf.constant(task_name, dtype=tf.string)
+                      for task_name in task_names]
 
     agent = Agent(len(action_set))
     outputs = {}
-    task_returns = {task_name: [] for task_name in task_names}
+    task_returns = collections.defaultdict(list)
 
     # this is good as we want to test on all environments
     # so I def need a list of tasks
-    for task_name in task_names:
-      env, _ = create_environment(env_sampler, task_name=task_name, seed=1, is_test=True)
-      outputs[task_name] = build_actor(agent, env, task_name, action_set)
+    for task_i, task_name in enumerate(task_names):
+      env = create_environment(
+          env_sampler, initial_task_name=task_name, seed=1, is_test=True)
+      outputs[task_name] = build_actor(
+          agent, env, task_names_ops[task_i], action_set)
 
     with tf.train.SingularMonitoredSession(
-        checkpoint_dir=FLAGS.logdir,
-        hooks=[py_process.PyProcessHook()]) as session:
+            checkpoint_dir=FLAGS.logdir,
+            hooks=[py_process.PyProcessHook()]) as session:
       for task_name in task_names:
         tf.logging.info('Testing task: %s', task_name)
         while True:

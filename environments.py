@@ -35,20 +35,28 @@ DEFAULT_ACTION_SET = (
     (4),    # Use
 )
 
+
 class PyProcessCraftLab(object):
   """CraftLab wrapper for PyProcess."""
 
-  def __init__(self, env, config, num_action_repeats=1, seed=0,
+  def __init__(self, env_sampler, task_name, config, num_action_repeats=1, seed=0,
                runfiles_path=None, level_cache=None):
 
     del runfiles_path, level_cache, config
     self._num_action_repeats = num_action_repeats
     self._random_state = np.random.RandomState(seed=seed)
     # config = {k: str(v) for k, v in config.iteritems()}
-    self._env = env
+    self._env = None
+    self._env_sampler = env_sampler
+    self._task_name = task_name
+    self._reset()
     self._observation_spec = self._env.obs_specs()
 
   def _reset(self):
+    """Sample a new environment to behave in."""
+    self._env = self._env_sampler.sample_environment(self._task_name)
+    print("Reset environment: task: {}: {}".format(
+        self._env.task_name, self._env.task))
     return self._env.reset(seed=self._random_state.randint(0, 2 ** 31 - 1))
 
   def _observation(self):
@@ -62,10 +70,13 @@ class PyProcessCraftLab(object):
     initial_obs = self._reset()
     return self._flatten_obs(initial_obs)
 
-  def step(self, action):
-    reward, done, observation = self._env.step(action, num_steps=self._num_action_repeats)
+  def step(self, action, task_name):
+    reward, done, observation = self._env.step(
+        action, num_steps=self._num_action_repeats)
     if done:
       # check if that's what I want!
+      # Change environment if needed
+      self._task_name = task_name
       self._reset()
     return reward, done, self._flatten_obs(observation)
 
@@ -91,6 +102,28 @@ class PyProcessCraftLab(object):
           tf.contrib.framework.TensorSpec([], tf.bool),
           observation_spec,
       )
+
+
+class SwitchCraftEnv(object):
+  """A TF environment wrapper that can change its environment if necessary.
+  """
+
+  def __init__(self, env):
+    """"""
+    self._env = env
+
+  def initial(self):
+    return self._env.initial()
+
+  def step(self, action):
+    reward, done, observation = self._env.step(action)
+
+    # Maybe reload
+    maybe_reload_op = tf.cond(done == true)
+    # Create environment with self.current_name
+
+    with tf.control_dependencies([maybe_reload_op]):
+      return reward, done, observation
 
 
 StepOutputInfo = collections.namedtuple('StepOutputInfo',
@@ -131,7 +164,8 @@ class FlowEnvironment(object):
     """
     with tf.name_scope('flow_environment_initial'):
       initial_reward = tf.constant(0., dtype=tf.float32)
-      initial_info = StepOutputInfo(tf.constant(0., dtype=tf.float32), tf.constant(0))
+      initial_info = StepOutputInfo(
+          tf.constant(0., dtype=tf.float32), tf.constant(0))
       initial_done = tf.constant(True)
       initial_observation = self._env.initial()
 
@@ -148,7 +182,7 @@ class FlowEnvironment(object):
       initial_state = (initial_flow, initial_info)
       return initial_output, initial_state
 
-  def step(self, action, state):
+  def step(self, action, state, task_name):
     """Takes a step in the environment.
 
     Args:
@@ -168,7 +202,7 @@ class FlowEnvironment(object):
       # Make sure the previous step has been executed before running the next
       # step.
       with tf.control_dependencies([flow]):
-        reward, done, observation = self._env.step(action)
+        reward, done, observation = self._env.step(action, task_name)
 
       with tf.control_dependencies(nest.flatten(observation)):
         new_flow = tf.add(flow, 1)
@@ -183,4 +217,5 @@ class FlowEnvironment(object):
           new_info)
 
       output = StepOutput(reward, new_info, done, observation)
+
       return output, new_state
