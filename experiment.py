@@ -80,7 +80,7 @@ flags.DEFINE_string(
     'hints_path', 'craft_env/resources/hints.yaml',
     'Path to hints for craft environment')
 flags.DEFINE_integer(
-    'max_steps', 200,
+    'max_steps', 100,
     'Maximum number of steps before the environment terminates on a failure.')
 
 # Curriculum settings.
@@ -680,7 +680,7 @@ def train(action_set):
             actor_task_assignments = np.random.choice(
                 task_names, FLAGS.num_actors, replace=FLAGS.num_actors > len(task_names))
             update_all_actors_tasks(
-                actor_task_assignments, actor_task_name_params, session)
+                actor_task_assignments, actor_task_name_params, session._tf_sess())
 
             next_task_switch_at += FLAGS.switch_tasks_every_k_frames
 
