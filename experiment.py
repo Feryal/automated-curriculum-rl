@@ -32,6 +32,8 @@ import sonnet as snt
 import tensorflow as tf
 import vtrace
 
+import curses
+
 try:
   import dynamic_batching
 except tf.errors.NotFoundError:
@@ -95,6 +97,10 @@ flags.DEFINE_float('decay', .99, 'RMSProp optimizer decay.')
 flags.DEFINE_float('momentum', 0., 'RMSProp momentum.')
 flags.DEFINE_float('epsilon', .1, 'RMSProp epsilon.')
 
+# Teacher params.
+flags.DEFINE_float(
+    'gamma', 0.3, 'Controls the minimum sampling probability for each task')
+flags.DEFINE_float('eta', 0.3, 'Learning rate of teacher')
 
 # Structure to be sent from actors to learner.
 ActorOutput = collections.namedtuple(
@@ -206,6 +212,35 @@ class Agent(snt.RNNCore):
       core_output_list.append(core_output)
 
     return snt.BatchApply(self._head)(tf.stack(core_output_list)), core_state
+
+
+class Teacher(object):
+
+  """Teacher using Exponential-weight algorithm for Exploration and Exploitation (Exp3) algorithm.
+  """
+
+  def __init__(self, tasks, gamma=0.3):
+    self._tasks = tasks
+    self._n_tasks = len(self._tasks)
+    self._gamma = gamma
+    self._log_weights = np.zeros(self._n_tasks)
+
+  @property
+  def task_probabilities(self):
+    weights = np.exp(self._log_weights)
+    return (1 - self._gamma)*weights / np.sum(weights) + self._gamma/self._n_tasks
+
+  def get_task(self):
+    """Samples a task, according to current Exp3 belief.
+    """
+    task_i = np.random.choice(self._n_tasks, p=self.task_probabilities)
+    return self._tasks[task_i]
+
+  def update(self, task, reward):
+    task_i = self._tasks.index(task)
+
+    reward_corrected = reward/self.task_probabilities[task_i]
+    self._log_weights[task_i] += self._gamma*reward_corrected/self._n_tasks
 
 
 def build_actor(agent, env, task_name_op, action_set):
@@ -415,9 +450,7 @@ def create_environment(env_sampler, initial_task_name=None, seed=0, is_test=Fals
   config = {}
   # if is_test:
   # check the heldout tasks?
-  p = py_process.PyProcess(environments.PyProcessCraftLab, env_sampler,
-                           initial_task_name, config,
-                           FLAGS.num_action_repeats, seed)
+  p = py_process.PyProcess(environments.PyProcessCraftLab, env_sampler, initial_task_name, config, FLAGS.num_action_repeats, seed)
 
   flow_env = environments.FlowEnvironment(p.proxy)
 
@@ -430,12 +463,15 @@ def create_environment(env_sampler, initial_task_name=None, seed=0, is_test=Fals
   return flow_env
 
 
-def update_all_actors_tasks(new_tasks_assignments, actor_task_name_params, session):
+def update_all_actors_tasks(new_tasks_assignments, actor_task_name_params, session, single_task=False):
   feed_dict = {}
   for actor_i in range(FLAGS.num_actors):
-    actor_task_name_params['task_name'][actor_i] = new_tasks_assignments[actor_i]
+    if single_task:
+      actor_task_name_params['task_name'][actor_i] = new_tasks_assignments[0]
+    else:
+      actor_task_name_params['task_name'][actor_i] = new_tasks_assignments[actor_i]
     feed_dict[actor_task_name_params['ph']
-              [actor_i]] = new_tasks_assignments[actor_i]
+              [actor_i]] = actor_task_name_params['task_name'][actor_i]
   # Update tasks for all actors
   session.run(actor_task_name_params['update'], feed_dict=feed_dict)
 
@@ -490,14 +526,15 @@ def train(action_set):
   # Only used to find the actor output structure.
   with tf.Graph().as_default():
     # here the meta learning algorithm should propose the task
-    # currently it is randomly generated
 
-    # here we could generate  i number of envs for i = len(num_actors)
-    # or alternavtively call env_sampler everytime, env_sampler is gonna be replaced
-    # by a teacher later
     env_sampler = env_factory.EnvironmentFactory(
         FLAGS.recipes_path, FLAGS.hints_path, max_steps=FLAGS.max_steps, seed=1)
     env = create_environment(env_sampler, seed=1)
+
+    teacher = Teacher(env_sampler.task_names, gamma=FLAGS.gamma)
+
+    weights_all = []
+    arm_probs_all = []
 
     agent = Agent(len(action_set))
     structure = build_actor(agent, env, '', action_set)
@@ -520,8 +557,8 @@ def train(action_set):
       actor_task_name_params = collections.defaultdict(list)
       for actor_i in range(FLAGS.num_actors):
         # Assign initial task name by round-robin
-        initial_task_name = task_names[actor_i % len(task_names)]
-
+        # initial_task_name = task_names[actor_i % len(task_names)]
+        initial_task_name = task_names[0]
         # Setup variables and assignment logic
         actor_task_name_var = tf.get_variable(
             "task_name_actor_{}".format(actor_i),
@@ -537,7 +574,6 @@ def train(action_set):
         assign_actor_task_name = tf.assign(
             actor_task_name_var, actor_task_name_ph,
             name='update_task_name_actor_{}'.format(actor_i))
-
         actor_task_name_params['task_name'].append(initial_task_name)
         actor_task_name_params['var'].append(actor_task_name_var)
         actor_task_name_params['ph'].append(actor_task_name_ph)
@@ -630,7 +666,9 @@ def train(action_set):
 
       if is_learner:
         # Logging.
-        task_returns = collections.defaultdict(lambda: collections.deque((), 10))
+        task_returns = collections.defaultdict(
+            lambda: collections.deque((), 10))
+        # currently only one task per update of Teacher
         summary_writer = tf.summary.FileWriterCache.get(FLAGS.logdir)
 
         # Prepare data for first run.
@@ -639,22 +677,26 @@ def train(action_set):
 
         # Execute learning and track performance.
         num_env_frames_v = 0
+        num_teacher_update = 0
         next_task_switch_at = FLAGS.switch_tasks_every_k_frames
 
         while num_env_frames_v < FLAGS.total_environment_frames:
+          student_progress = []
           task_names_v, done_v, infos_v, num_env_frames_v, _ = session.run(
               (data_from_actors.task_name,) + output + (stage_op,))
           task_names_v = np.repeat([task_names_v], done_v.shape[0], 0)
 
-          for task_name, episode_return, episode_step in zip(
+          for task_name, episode_return, episode_progress, episode_step in zip(
                   task_names_v[done_v],
                   infos_v.episode_return[done_v],
+                  infos_v.episode_progress[done_v],
                   infos_v.episode_step[done_v]):
             episode_frames = episode_step * FLAGS.num_action_repeats
 
             # tf.logging.info('Task: %s Episode return: %f',
             # task_name, episode_return)
             task_returns[task_name].append(episode_return)
+            student_progress.append(episode_progress)
 
             summary = tf.summary.Summary()
             summary.value.add(tag=task_name + '/episode_return',
@@ -663,28 +705,39 @@ def train(action_set):
                               simple_value=episode_frames)
             summary.value.add(tag=task_name + '/mean_episode_return',
                               simple_value=np.mean(task_returns[task_name]))
+            summary.value.add(tag='Teacher/progress',
+                              simple_value=episode_progress)
+            summary.value.add(tag=task_name +'/progress',
+                              simple_value=episode_progress)
             summary_writer.add_summary(summary, num_env_frames_v)
 
-          for task_name in task_names:
-            tf.logging.info("[%d] Task: %s, Episode return mean: %f",
-                            num_env_frames_v,
-                            task_name,
-                            np.mean(task_returns[task_name]))
           # Now update the task_names per actor, rolling fashion
           if num_env_frames_v >= next_task_switch_at:
             print("Let's update the tasks for all actors now!")
             print(task_names)
             print(actor_task_name_params['task_name'])
 
+            teacher.update(
+                actor_task_name_params['task_name'][0], np.mean(student_progress))
+
+            weights_all.append(teacher._log_weights)
+            arm_probs_all.append(teacher.task_probabilities)
+
+            summary.value.add(tag='Teacher/progress_2',
+                              simple_value=np.mean(student_progress))
+
             # Random assignment
-            actor_task_assignments = np.random.choice(
-                task_names, FLAGS.num_actors, replace=FLAGS.num_actors > len(task_names))
+            actor_task_assignments = [teacher.get_task()]
             update_all_actors_tasks(
-                actor_task_assignments, actor_task_name_params, session._tf_sess())
-
+                actor_task_assignments, actor_task_name_params, session._tf_sess(), single_task=True)
+            num_teacher_update += 1
             next_task_switch_at += FLAGS.switch_tasks_every_k_frames
-
             print("done! next update at {}".format(next_task_switch_at))
+            # for task_name in task_names:
+            #   tf.logging.info("[%d] Task: %s, Episode return mean: %f",
+            #                 num_env_frames_v, task_name, np.mean(task_returns[task_name]))
+            tf.logging.info("[%d] Task: %s, Episode return mean: %f",
+                            num_env_frames_v, actor_task_name_params['task_name'][0], np.mean(task_returns[actor_task_name_params['task_name'][0]]))
       else:
         # Execute actors (they just need to enqueue their output).
         while True:
@@ -696,7 +749,7 @@ def test(action_set):
   with tf.Graph().as_default():
     # Get EnvironmentFactory
     env_sampler = env_factory.EnvironmentFactory(
-        FLAGS.recipes_path, FLAGS.hints_path, max_steps=FLAGS.max_steps, seed=1)
+        FLAGS.recipes_path, FLAGS.hints_path, max_steps=FLAGS.max_steps, seed=1, visualise=True)
 
     task_names = env_sampler.task_names
     task_names_ops = [tf.constant(task_name, dtype=tf.string)

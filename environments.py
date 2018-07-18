@@ -104,7 +104,7 @@ class PyProcessCraftLab(object):
 
 
 StepOutputInfo = collections.namedtuple('StepOutputInfo',
-                                        'episode_return episode_step')
+                                        'episode_return episode_progress episode_step')
 StepOutput = collections.namedtuple('StepOutput',
                                     'reward info done observation')
 
@@ -142,7 +142,7 @@ class FlowEnvironment(object):
     with tf.name_scope('flow_environment_initial'):
       initial_reward = tf.constant(0., dtype=tf.float32)
       initial_info = StepOutputInfo(
-          tf.constant(0., dtype=tf.float32), tf.constant(0))
+          tf.constant(0., dtype=tf.float32), tf.constant(0., dtype=tf.float32), tf.constant(0))
       initial_done = tf.constant(True)
       initial_observation = self._env.initial()
 
@@ -186,12 +186,13 @@ class FlowEnvironment(object):
 
       # When done, include the reward in the output info but not in the
       # state for the next step.
-      new_info = StepOutputInfo(info.episode_return + reward,
+      # TODO make progress be just the return for now (change later to reflect the progress signals)
+      progress_update = reward
+      new_info = StepOutputInfo(info.episode_return + reward, info.episode_progress + progress_update,
                                 info.episode_step + 1)
       new_state = new_flow, nest.map_structure(
           lambda a, b: tf.where(done, a, b),
-          StepOutputInfo(tf.constant(0., dtype=tf.float32), tf.constant(0)),
-          new_info)
+          StepOutputInfo(tf.constant(0., dtype=tf.float32), tf.constant(0., dtype=tf.float32), tf.constant(0)), new_info)
 
       output = StepOutput(reward, new_info, done, observation)
 
