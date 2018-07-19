@@ -9,13 +9,9 @@ In order to start, I adapted the Craft Environment from work by Andreas et al.,[
 Currently, I have interfaced IMPALA[[2]](##References), a GPU utilised  version of A3C architecture which uses multiple distributed actors with V-Trace off-policy correction, with my Craft Environment to train on all the possible Craft tasks concurrently. This is possible by providing the hash of the task name as instruction to the network (similar setup to DMLab IMPALA, using an LSTM to process the instruction, maybe an overkill here). I am currently investigating the effect of hyper parameters (e.g. episode length) and network architecture on performance. These tasks are currently randomly selected and proposed to the student network with a hyper parameter for how often the task is changed for each actor. Note, that every episode the environment setup changes for a given task. Next, I will implement my teacher network in order to have a smarter, automated, task proposal.
 
 Other papers that I am inspired by in this work include [[3]](##References), [[4]](##References).
-<div style="text-align:center ; width:200px;">
-<a href='https://xkcd.com/894/'>
 
 ![](https://www.explainxkcd.com/wiki/images/6/69/progeny.png)
 
-</a>
-</div>
 
 ## Usage:
 
