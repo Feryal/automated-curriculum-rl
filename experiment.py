@@ -99,7 +99,7 @@ flags.DEFINE_float('epsilon', .1, 'RMSProp epsilon.')
 
 # Teacher params.
 flags.DEFINE_float(
-    'gamma', 0.3, 'Controls the minimum sampling probability for each task')
+    'gamma', 0.2, 'Controls the minimum sampling probability for each task')
 flags.DEFINE_float('eta', 0.3, 'Learning rate of teacher')
 flags.DEFINE_enum(
     'progress_signal', 'reward', ['reward', 'gradient_norm'],
@@ -444,7 +444,7 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
     gradient_norm = tf.global_norm(gradients)
     # TODO renormalize gradients hack, should be done better...
     progress_signal = tf.divide(
-        gradient_norm, 300., name='progress_gradient_norm')
+        gradient_norm, 500., name='progress_gradient_norm')
 
   # Merge updating the network and environment frames into a single tensor.
   with tf.control_dependencies([train_op]):
@@ -763,14 +763,14 @@ def train(action_set):
             weights_all.append(teacher._log_weights)
             arm_probs_all.append(teacher.task_probabilities)
 
-            summary = tf.summary.Summary()
-            summary.value.add(
+            summary_teacher = tf.summary.Summary()
+            summary_teacher.value.add(
                 tag='Teacher/at_update_student_progress',
                 simple_value=np.mean(student_progress))
-            summary.value.add(
+            summary_teacher.value.add(
                 tag='Teacher/at_update_progress_signal',
                 simple_value=progress_for_teacher)
-            summary_writer.add_summary(summary, num_env_frames_v)
+            summary_writer.add_summary(summary_teacher, num_env_frames_v)
 
             # Get new task from the Teacher
             actor_task_assignments = [teacher.get_task()]
