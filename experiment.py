@@ -428,6 +428,11 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
                                         FLAGS.momentum, FLAGS.epsilon)
   train_op = optimizer.minimize(total_loss)
 
+  # compute norm of gradients as the progress signal
+  params = tf.trainable_variables()
+  gradients = tf.gradients(total_loss, params)
+  gradient_norm = tf.global_norm(gradients)
+
   # Merge updating the network and environment frames into a single tensor.
   with tf.control_dependencies([train_op]):
     num_env_frames_and_train = num_env_frames.assign_add(
@@ -437,7 +442,7 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
   tf.summary.scalar('learning_rate', learning_rate)
   tf.summary.scalar('total_loss', total_loss)
   tf.summary.histogram('action', agent_outputs.action)
-
+  tf.summary.scalar('gradient_norm', gradient_norm)
   return done, infos, num_env_frames_and_train
 
 
