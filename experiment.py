@@ -101,6 +101,9 @@ flags.DEFINE_float('epsilon', .1, 'RMSProp epsilon.')
 flags.DEFINE_float(
     'gamma', 0.3, 'Controls the minimum sampling probability for each task')
 flags.DEFINE_float('eta', 0.3, 'Learning rate of teacher')
+flags.DEFINE_enum(
+    'progress_signal', 'reward', ['reward', 'gradient_norm'],
+    'Type of signal to use when tracking down progress of students. ')
 
 # Structure to be sent from actors to learner.
 ActorOutput = collections.namedtuple(
@@ -428,10 +431,20 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
                                         FLAGS.momentum, FLAGS.epsilon)
   train_op = optimizer.minimize(total_loss)
 
-  # compute norm of gradients as the progress signal
-  params = tf.trainable_variables()
-  gradients = tf.gradients(total_loss, params)
-  gradient_norm = tf.global_norm(gradients)
+  # Compute progress signal
+  if FLAGS.progress_signal == 'reward':
+    # Rewards is TxB, but as gradient_norm below gives only a scalar, let's convert it to a scalar too.
+    # we sum across time T and average across batch B, similar to what student_progress below is.
+    progress_signal = tf.reduce_mean(
+        tf.reduce_sum(rewards, axis=0), name='progress_reward')
+  elif FLAGS.progress_signal == 'gradient_norm':
+    # compute norm of gradients as the progress signal
+    params = tf.trainable_variables()
+    gradients = tf.gradients(total_loss, params)
+    gradient_norm = tf.global_norm(gradients)
+    # TODO renormalize gradients hack, should be done better...
+    progress_signal = tf.divide(
+        gradient_norm, 300., name='progress_gradient_norm')
 
   # Merge updating the network and environment frames into a single tensor.
   with tf.control_dependencies([train_op]):
@@ -442,8 +455,9 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
   tf.summary.scalar('learning_rate', learning_rate)
   tf.summary.scalar('total_loss', total_loss)
   tf.summary.histogram('action', agent_outputs.action)
-  tf.summary.scalar('gradient_norm', gradient_norm)
-  return done, infos, num_env_frames_and_train
+  tf.summary.scalar('progress_signal', progress_signal)
+
+  return done, infos, num_env_frames_and_train, progress_signal
 
 
 def create_environment(env_sampler, initial_task_name=None, seed=0, is_test=False):
@@ -652,9 +666,10 @@ def train(action_set):
         data_from_actors = nest.pack_sequence_as(structure, area.get())
 
         # Unroll agent on sequence, create losses and update ops.
-        output = build_learner(agent, data_from_actors.agent_state,
-                               data_from_actors.env_outputs,
-                               data_from_actors.agent_outputs)
+        done, infos, num_env_frames_and_train, progress_signal = (
+            build_learner(agent, data_from_actors.agent_state,
+                          data_from_actors.env_outputs,
+                          data_from_actors.agent_outputs))
 
     # Create MonitoredSession (to run the graph, checkpoint and log).
     tf.logging.info('Creating MonitoredSession, is_chief %s', is_learner)
@@ -684,12 +699,19 @@ def train(action_set):
         num_env_frames_v = 0
         num_teacher_update = 0
         next_task_switch_at = FLAGS.switch_tasks_every_k_frames
+        progress_since_switch = []
 
         while num_env_frames_v < FLAGS.total_environment_frames:
           student_progress = []
-          task_names_v, done_v, infos_v, num_env_frames_v, _ = session.run(
-              (data_from_actors.task_name,) + output + (stage_op,))
+          (task_names_v, done_v, infos_v, num_env_frames_v, progress_signal_v,
+           _) = session.run(
+               (data_from_actors.task_name, done, infos,
+                num_env_frames_and_train, progress_signal, stage_op))
           task_names_v = np.repeat([task_names_v], done_v.shape[0], 0)
+
+          # Keep the progress_signal across training batches, and average them
+          # later when the Teacher needs to switch
+          progress_since_switch.append(progress_signal_v)
 
           for task_name, episode_return, episode_progress, episode_step in zip(
                   task_names_v[done_v],
@@ -710,10 +732,13 @@ def train(action_set):
                               simple_value=episode_frames)
             summary.value.add(tag=task_name + '/mean_episode_return',
                               simple_value=np.mean(task_returns[task_name]))
-            summary.value.add(tag='Teacher/progress',
+            summary.value.add(tag='Teacher/episode_returns',
                               simple_value=episode_progress)
+            summary.value.add(
+                tag='Teacher/progress_signal_' + FLAGS.progress_signal,
+                simple_value=progress_signal_v)
             summary.value.add(tag=task_name +'/progress',
-                              simple_value=episode_progress)
+                              simple_value=progress_signal_v)
             summary_writer.add_summary(summary, num_env_frames_v)
 
           # Now update the task_names per actor, rolling fashion
@@ -722,27 +747,46 @@ def train(action_set):
             print(task_names)
             print(actor_task_name_params['task_name'])
 
-            teacher.update(
-                actor_task_name_params['task_name'][0], np.mean(student_progress))
+            # TODO progress_signal_v is being transformed to a Scalar in
+            # build_learner().
+            # This is because for tf.gradient_norm, we get the sum, whereas for
+            # rewards, we have access to a TxB tensor (which we sum across time
+            # T and average across batch B)
+            progress_for_teacher = np.mean(progress_since_switch)
+            progress_since_switch = []
+
+            teacher.update(actor_task_name_params['task_name'][0],
+                           progress_for_teacher)
+            # teacher.update(actor_task_name_params['task_name'][0],
+            #  np.mean(student_progress))
 
             weights_all.append(teacher._log_weights)
             arm_probs_all.append(teacher.task_probabilities)
 
-            summary.value.add(tag='Teacher/progress_2',
-                              simple_value=np.mean(student_progress))
+            summary = tf.summary.Summary()
+            summary.value.add(
+                tag='Teacher/at_update_student_progress',
+                simple_value=np.mean(student_progress))
+            summary.value.add(
+                tag='Teacher/at_update_progress_signal',
+                simple_value=progress_for_teacher)
+            summary_writer.add_summary(summary, num_env_frames_v)
 
-            # Random assignment
+            # Get new task from the Teacher
             actor_task_assignments = [teacher.get_task()]
             update_all_actors_tasks(
-                actor_task_assignments, actor_task_name_params, session._tf_sess(), single_task=True)
+                actor_task_assignments,
+                actor_task_name_params,
+                session._tf_sess(),
+                single_task=True)
             num_teacher_update += 1
             next_task_switch_at += FLAGS.switch_tasks_every_k_frames
             print("done! next update at {}".format(next_task_switch_at))
-            # for task_name in task_names:
-            #   tf.logging.info("[%d] Task: %s, Episode return mean: %f",
-            #                 num_env_frames_v, task_name, np.mean(task_returns[task_name]))
-            tf.logging.info("[%d] Task: %s, Episode return mean: %f",
-                            num_env_frames_v, actor_task_name_params['task_name'][0], np.mean(task_returns[actor_task_name_params['task_name'][0]]))
+            tf.logging.info("[%d] Task: %s, Episode return mean: %.3f, "
+                            "Teacher progress signal: %.3f",
+                            num_env_frames_v, task_name,
+                            np.mean(task_returns[task_name]),
+                            progress_for_teacher)
       else:
         # Execute actors (they just need to enqueue their output).
         while True:
