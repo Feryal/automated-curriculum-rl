@@ -552,8 +552,8 @@ def train(action_set):
 
     teacher = Teacher(env_sampler.task_names, gamma=FLAGS.gamma)
 
-    weights_all = []
-    arm_probs_all = []
+    weights_all = collections.deque([], 500)
+    arm_probs_all = collections.deque([], 500)
 
     agent = Agent(len(action_set))
     structure = build_actor(agent, env, '', action_set)
