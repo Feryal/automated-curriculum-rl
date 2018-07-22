@@ -47,7 +47,7 @@ nest = tf.contrib.framework.nest
 flags = tf.app.flags
 FLAGS = tf.app.flags.FLAGS
 
-flags.DEFINE_string('logdir', '/tmp/agent', 'TensorFlow log directory.')
+flags.DEFINE_string('logdir', '../results', 'TensorFlow log directory.')
 flags.DEFINE_enum('mode', 'train', ['train', 'test'], 'Training or test mode.')
 
 # Flags used for testing.
@@ -119,10 +119,11 @@ def is_single_machine():
 class Agent(snt.RNNCore):
   """Agent with ResNet."""
 
-  def __init__(self, num_actions):
+  def __init__(self, num_actions, obs_specs):
     super(Agent, self).__init__(name='agent')
 
     self._num_actions = num_actions
+    self._obs_specs = obs_specs
 
     with self._enter_variable_scope():
       # read the model params this from config
@@ -159,15 +160,20 @@ class Agent(snt.RNNCore):
 
   def _torso(self, input_):
     last_action, env_output = input_
-    reward, _, _, (features, task_name) = env_output
+    reward, _, _, observations = env_output
 
-    features_out = tf.nn.relu(features)
+    # Repack observations
+    observations_dict = {
+        obs_name: observations[obs_i]
+        for obs_i, obs_name in enumerate(self._obs_specs.keys())
+    }
+    features_out = tf.nn.relu(observations_dict['features'])
     features_out = snt.BatchFlatten()(features_out)
 
     features_out = snt.Linear(256)(features_out)
     features_out = tf.nn.relu(features_out)
 
-    instruction_out = self._instruction(task_name)
+    instruction_out = self._instruction(observations_dict['task_name'])
 
     # Append clipped last reward and one hot last action.
     clipped_reward = tf.expand_dims(tf.clip_by_value(reward, -1, 1), -1)
@@ -460,16 +466,18 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
   return done, infos, num_env_frames_and_train, progress_signal
 
 
-def create_environment(env_sampler, initial_task_name=None, seed=0, is_test=False):
+def create_environment(env_sampler,
+                       initial_task_name=None,
+                       seed=0):
   """Creates an environment wrapped in a `FlowEnvironment`."""
   # Sample a task if not provided
   if initial_task_name is None:
     initial_task_name = np.random.choice(env_sampler.task_names)
   # config is empty dict for now
   config = {}
-  # if is_test:
-  # check the heldout tasks?
-  p = py_process.PyProcess(environments.PyProcessCraftLab, env_sampler, initial_task_name, config, FLAGS.num_action_repeats, seed)
+  p = py_process.PyProcess(environments.PyProcessCraftLab, env_sampler,
+                           initial_task_name, config, FLAGS.num_action_repeats,
+                           seed)
 
   flow_env = environments.FlowEnvironment(p.proxy)
 
@@ -548,6 +556,8 @@ def train(action_set):
 
     env_sampler = env_factory.EnvironmentFactory(
         FLAGS.recipes_path, FLAGS.hints_path, max_steps=FLAGS.max_steps, seed=1)
+    dummy_env = env_sampler.sample_environment()
+    obs_spec = dummy_env.obs_specs()
     env = create_environment(env_sampler, seed=1)
 
     teacher = Teacher(env_sampler.task_names, gamma=FLAGS.gamma)
@@ -555,7 +565,7 @@ def train(action_set):
     weights_all = collections.deque([], 500)
     arm_probs_all = collections.deque([], 500)
 
-    agent = Agent(len(action_set))
+    agent = Agent(len(action_set), obs_spec)
     structure = build_actor(agent, env, '', action_set)
     flattened_structure = nest.flatten(structure)
     dtypes = [t.dtype for t in flattened_structure]
@@ -569,7 +579,7 @@ def train(action_set):
     # Create Queue and Agent on the learner.
     with tf.device(shared_job_device):
       queue = tf.FIFOQueue(1, dtypes, shapes, shared_name='buffer')
-      agent = Agent(len(action_set))
+      agent = Agent(len(action_set), obs_spec)
 
       # Setup the task names variables and assignment logic
       task_names = env_sampler.task_names
@@ -760,9 +770,18 @@ def train(action_set):
             # teacher.update(actor_task_name_params['task_name'][0],
             #  np.mean(student_progress))
 
-            weights_all.append(teacher._log_weights)
-            arm_probs_all.append(teacher.task_probabilities)
-
+            weights_all.append((num_teacher_update, teacher._log_weights))
+            arm_probs_all.append((num_teacher_update,
+                                  teacher.task_probabilities))
+            np.save(
+                os.path.join(FLAGS.logdir, "teaching_output_{}_{}.npy".format(
+                    num_teacher_update, num_env_frames_v)), {
+                        "weights": weights_all,
+                        "arm_probs": arm_probs_all,
+                        "task_returns": dict(task_returns),
+                        "num_env_frames": num_env_frames_v,
+                        "num_teacher_update": num_teacher_update
+                    })
             summary_teacher = tf.summary.Summary()
             summary_teacher.value.add(
                 tag='Teacher/at_update_student_progress',
@@ -799,22 +818,19 @@ def test(action_set):
     # Get EnvironmentFactory
     env_sampler = env_factory.EnvironmentFactory(
         FLAGS.recipes_path, FLAGS.hints_path, max_steps=FLAGS.max_steps, seed=1, visualise=True)
+    dummy_env = env_sampler.sample_environment()
+    obs_spec = dummy_env.obs_specs()
+    task_names = sorted(env_sampler.task_names)
 
-    task_names = env_sampler.task_names
-    task_names_ops = [tf.constant(task_name, dtype=tf.string)
-                      for task_name in task_names]
-
-    agent = Agent(len(action_set))
+    agent = Agent(len(action_set), obs_spec)
     outputs = {}
-    task_returns = collections.defaultdict(list)
+    task_returns = collections.defaultdict(lambda: collections.deque([], 5000))
 
-    # this is good as we want to test on all environments
-    # so I def need a list of tasks
-    for task_i, task_name in enumerate(task_names):
+    # Test on all environments one after another
+    for task_name in task_names:
       env = create_environment(
-          env_sampler, initial_task_name=task_name, seed=1, is_test=True)
-      outputs[task_name] = build_actor(
-          agent, env, task_names_ops[task_i], action_set)
+          env_sampler, initial_task_name=task_name, seed=1)
+      outputs[task_name] = build_actor(agent, env, task_name, action_set)
 
     with tf.train.SingularMonitoredSession(
             checkpoint_dir=FLAGS.logdir,
@@ -822,12 +838,31 @@ def test(action_set):
       for task_name in task_names:
         tf.logging.info('Testing task: %s', task_name)
         while True:
-          done_v, infos_v = session.run((
-              outputs[task_name].env_outputs.done,
-              outputs[task_name].env_outputs.info
-          ))
+          rewards_v, done_v, observations_v = session.run(
+              (outputs[task_name].env_outputs.reward,
+               outputs[task_name].env_outputs.done,
+               outputs[task_name].env_outputs.observation))
+
+          # Repack the environment outputs
+          rewards_v = rewards_v[1:]
+          done_v = done_v[1:]
+          observations_dict = {
+            obs_name: observations_v[obs_i][1:]
+            for obs_i, obs_name in enumerate(obs_spec.keys())
+          }
+
+          # Check the performance
+          episode_returns = rewards_v[done_v]
           returns = task_returns[task_name]
-          returns.extend(infos_v.episode_return[1:][done_v[1:]])
+          returns.extend(episode_returns)
+
+          # Visualise render
+          for frame_i, frame in enumerate(observations_dict['image']):
+            dummy_env.render_matplotlib(frame=frame, delta_time=0.05)
+            if rewards_v[frame_i]:
+              rewarding_frame = np.ones_like(frame) * np.array([0, 1, 0])
+              dummy_env.render_matplotlib(
+                  frame=rewarding_frame, delta_time=0.2)
 
           if len(returns) >= FLAGS.test_num_episodes:
             tf.logging.info('Mean episode return: %f', np.mean(returns))

@@ -85,20 +85,22 @@ class PyProcessCraftLab(object):
   @staticmethod
   def _tensor_specs(method_name, unused_kwargs, constructor_kwargs):
     """Returns a nest of `TensorSpec` with the method's output specification."""
-    del constructor_kwargs
-    # TODO: hardcoded shapes, fix me!
-    # add to config
+    # Find out about observation specs
+    dummy_env = constructor_kwargs['env_sampler'].sample_environment()
+    env_obs_specs = dummy_env.obs_specs()
+
     observation_spec = [
-        tf.contrib.framework.TensorSpec([1076, ], tf.float32),
-        tf.contrib.framework.TensorSpec([], tf.string),
+        tf.contrib.framework.TensorSpec(
+            obs_spec['shape'], obs_spec['dtype'], name=obs_name)
+        for obs_name, obs_spec in env_obs_specs.iteritems()
     ]
 
     if method_name == 'initial':
       return observation_spec
     elif method_name == 'step':
       return (
-          tf.contrib.framework.TensorSpec([], tf.float32),
-          tf.contrib.framework.TensorSpec([], tf.bool),
+          tf.contrib.framework.TensorSpec([], tf.float32, name='reward'),
+          tf.contrib.framework.TensorSpec([], tf.bool, name='done'),
           observation_spec,
       )
 
