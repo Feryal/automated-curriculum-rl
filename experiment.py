@@ -167,13 +167,13 @@ class Agent(snt.RNNCore):
     features_out = snt.Linear(256)(features_out)
     features_out = tf.nn.relu(features_out)
 
-    # instruction_out = self._instruction(task_name)
+    instruction_out = self._instruction(task_name)
 
     # Append clipped last reward and one hot last action.
     clipped_reward = tf.expand_dims(tf.clip_by_value(reward, -1, 1), -1)
     one_hot_last_action = tf.one_hot(last_action, self._num_actions)
     return tf.concat(
-        [features_out, clipped_reward, one_hot_last_action],
+        [features_out, clipped_reward, one_hot_last_action, instruction_out],
         axis=1)
 
   def _head(self, core_output):
