@@ -104,6 +104,8 @@ flags.DEFINE_float('eta', 0.3, 'Learning rate of teacher')
 flags.DEFINE_enum(
     'progress_signal', 'reward', ['reward', 'gradient_norm'],
     'Type of signal to use when tracking down progress of students. ')
+flags.DEFINE_integer('save_every_k_teacher_updates', int(50),
+                     'Write the Teacher signals to files at this frequency.')
 
 # Structure to be sent from actors to learner.
 ActorOutput = collections.namedtuple(
@@ -562,9 +564,6 @@ def train(action_set):
 
     teacher = Teacher(env_sampler.task_names, gamma=FLAGS.gamma)
 
-    weights_all = collections.deque([], 50)
-    arm_probs_all = collections.deque([], 50)
-
     agent = Agent(len(action_set), obs_spec)
     structure = build_actor(agent, env, '', action_set)
     flattened_structure = nest.flatten(structure)
@@ -695,10 +694,6 @@ def train(action_set):
             hooks=[py_process.PyProcessHook()]) as session:
 
       if is_learner:
-        # Logging.
-        task_returns = collections.defaultdict(
-            lambda: collections.deque((), 10))
-        # currently only one task per update of Teacher
         summary_writer = tf.summary.FileWriterCache.get(FLAGS.logdir)
 
         # Prepare data for first run.
@@ -709,53 +704,73 @@ def train(action_set):
         num_env_frames_v = 0
         num_teacher_update = 0
         next_task_switch_at = FLAGS.switch_tasks_every_k_frames
+        last_return_tasks = {}
         progress_since_switch = []
+        returns_task_since_switch = collections.defaultdict(list)
+        teacher_history = collections.defaultdict(dict)
 
         while num_env_frames_v < FLAGS.total_environment_frames:
-          student_progress = []
+          # Perform one training step, on a minibatch.
           (task_names_v, done_v, infos_v, num_env_frames_v, progress_signal_v,
            _) = session.run(
                (data_from_actors.task_name, done, infos,
                 num_env_frames_and_train, progress_signal, stage_op))
-          task_names_v = np.repeat([task_names_v], done_v.shape[0], 0)
 
           # Keep the progress_signal across training batches, and average them
           # later when the Teacher needs to switch
           progress_since_switch.append(progress_signal_v)
 
-          for task_name, episode_return, episode_progress, episode_step in zip(
-                  task_names_v[done_v],
-                  infos_v.episode_return[done_v],
-                  infos_v.episode_progress[done_v],
-                  infos_v.episode_step[done_v]):
-            episode_frames = episode_step * FLAGS.num_action_repeats
+          # Per task, let's average metrics in the current minibatch.
+          for task_name in task_names:
+            # TODO note that for now, the full minibatch has the same task, so
+            # this for-loop is overkill, but it's future-proof.
+            # Check it later to be sure it works as expected.
 
-            # tf.logging.info('Task: %s Episode return: %f',
-            # task_name, episode_return)
-            task_returns[task_name].append(episode_return)
-            student_progress.append(episode_progress)
+            # Only keep the minibatch_i (2nd dim) for the current task.
+            done_task = done_v[:, task_names_v == task_name]
 
-            summary = tf.summary.Summary()
-            summary.value.add(tag=task_name + '/episode_return',
-                              simple_value=episode_return)
-            summary.value.add(tag=task_name + '/episode_frames',
-                              simple_value=episode_frames)
-            summary.value.add(tag=task_name + '/mean_episode_return',
-                              simple_value=np.mean(task_returns[task_name]))
-            summary.value.add(tag='Teacher/episode_returns',
-                              simple_value=episode_progress)
-            summary.value.add(
-                tag='Teacher/progress_signal_' + FLAGS.progress_signal,
-                simple_value=progress_signal_v)
-            summary.value.add(tag=task_name +'/progress',
-                              simple_value=progress_signal_v)
-            summary_writer.add_summary(summary, num_env_frames_v)
+            if done_task.size > 0:
+              # This task was present in this minibatch
+              task_episode_return = np.mean(infos_v.episode_return[done_task])
+              task_episode_frames = np.mean(
+                  infos_v.episode_step[done_task] * FLAGS.num_action_repeats)
 
-          # Now update the task_names per actor, rolling fashion
+              # For every task, keep the last returns.
+              last_return_tasks[task_name] = task_episode_return
+
+              # One summary per task in this minibatch.
+              summary = tf.summary.Summary()
+              summary.value.add(
+                  tag=task_name + '/episode_return',
+                  simple_value=task_episode_return)
+              summary.value.add(
+                  tag=task_name + '/episode_frames',
+                  simple_value=task_episode_frames)
+              summary.value.add(
+                  tag=task_name + '/progress',
+                  simple_value=progress_signal_v)
+              summary.value.add(
+                  tag='Teacher/progress_signal_' + FLAGS.progress_signal,
+                  simple_value=progress_signal_v)
+              summary.value.add(
+                  tag='Teacher/task_selected',
+                  simple_value=task_names.index(task_name))
+              summary_writer.add_summary(summary, num_env_frames_v)
+
+            # Keep track of returns for all tasks, through time
+            # (default to 0 if the task was never selected yet)
+            # This will keep the last score even when the task is not retrained
+            # on, but that's actually what Tensorboard shows, so it's ok.
+            returns_task_since_switch[task_name].append(
+                last_return_tasks.get(task_name, 0))
+
+          # Now ask the Teacher for new tasks to train on!
           if num_env_frames_v >= next_task_switch_at:
             print("Let's update the tasks for all actors now!")
-            print(task_names)
             print(actor_task_name_params['task_name'])
+
+            # We are currently setting a single task for all actors.
+            last_selected_task_name = actor_task_name_params['task_name'][0]
 
             # TODO progress_signal_v is being transformed to a Scalar in
             # build_learner().
@@ -763,50 +778,72 @@ def train(action_set):
             # rewards, we have access to a TxB tensor (which we sum across time
             # T and average across batch B)
             progress_for_teacher = np.mean(progress_since_switch)
-            progress_since_switch = []
 
-            teacher.update(actor_task_name_params['task_name'][0],
-                           progress_for_teacher)
-            # teacher.update(actor_task_name_params['task_name'][0],
-            #  np.mean(student_progress))
+            # Update Teacher according to the progress signal we got!
+            teacher.update(last_selected_task_name, progress_for_teacher)
 
-            weights_all.append((num_teacher_update, teacher._log_weights))
-            arm_probs_all.append((num_teacher_update,
-                                  teacher.task_probabilities))
-            if num_teacher_update % 49 == 0:
-              np.save(
-                  os.path.join(FLAGS.logdir, "teaching_output_{}_{}.npy".format(
-                      num_teacher_update, num_env_frames_v)), {
-                          "weights": weights_all,
-                          "arm_probs": arm_probs_all,
-                          "task_returns": dict(task_returns),
-                          "num_env_frames": num_env_frames_v,
-                          "num_teacher_update": num_teacher_update
-                  })
-            summary_teacher = tf.summary.Summary()
-            summary_teacher.value.add(
-                tag='Teacher/at_update_student_progress',
-                simple_value=np.mean(student_progress))
-            summary_teacher.value.add(
-                tag='Teacher/at_update_progress_signal',
-                simple_value=progress_for_teacher)
-            summary_writer.add_summary(summary_teacher, num_env_frames_v)
+            # Compute average return for all tasks since last switch
+            task_average_returns = {
+                task_name: np.mean(returns_task_since_switch[task_name])
+                for task_name in task_names
+            }
 
-            # Get new task from the Teacher
+            # Get new task from the Teacher and update Actors
             actor_task_assignments = [teacher.get_task()]
             update_all_actors_tasks(
                 actor_task_assignments,
                 actor_task_name_params,
                 session._tf_sess(),
                 single_task=True)
+
+            # Log / Tensorboard
+            tf.logging.info("[%d][%d] Task: %s, Episode return mean: %.3f, "
+                            "Teacher progress signal: %.3f",
+                            num_teacher_update, num_env_frames_v,
+                            last_selected_task_name,
+                            task_average_returns[last_selected_task_name],
+                            progress_for_teacher)
+            summary_teacher = tf.summary.Summary()
+            summary_teacher.value.add(
+                tag='Teacher/at_update_task_returns',
+                simple_value=task_average_returns[last_selected_task_name])
+            summary_teacher.value.add(
+                tag='Teacher/at_update_progress_signal',
+                simple_value=progress_for_teacher)
+            summary_writer.add_summary(summary_teacher, num_env_frames_v)
+
+            # Keep track of teacher state
+            teacher_history['progress_signal'][num_teacher_update] = (
+                progress_for_teacher)
+            teacher_history['weights'][num_teacher_update] = (
+                teacher._log_weights.copy())
+            teacher_history['arm_probs'][num_teacher_update] = (
+                teacher.task_probabilities.copy())
+            teacher_history['last_selected_task_name'][num_teacher_update] = (
+                last_selected_task_name)
+            teacher_history['num_env_frames'][num_teacher_update] = (
+                num_env_frames_v)
+            teacher_history['task_returns'][num_teacher_update] = (
+                task_average_returns)
+            teacher_history['task_names'] = task_names
+
+            # Store teacher history for analysis
+            if ((num_teacher_update + 1) %
+                FLAGS.save_every_k_teacher_updates == 0):
+              np.save(
+                  os.path.join(FLAGS.logdir, "teaching_output_{}.npy".format(
+                      num_teacher_update)),
+                  dict(teacher_history))
+              # Reset teacher history to be super safe
+              teacher_history = collections.defaultdict(dict)
+
+            # ... finish this switch
+            progress_since_switch = []
+            returns_task_since_switch = collections.defaultdict(list)
             num_teacher_update += 1
             next_task_switch_at += FLAGS.switch_tasks_every_k_frames
             print("done! next update at {}".format(next_task_switch_at))
-            tf.logging.info("[%d] Task: %s, Episode return mean: %.3f, "
-                            "Teacher progress signal: %.3f",
-                            num_env_frames_v, task_name,
-                            np.mean(task_returns[task_name]),
-                            progress_for_teacher)
+
       else:
         # Execute actors (they just need to enqueue their output).
         while True:
