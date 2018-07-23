@@ -562,8 +562,8 @@ def train(action_set):
 
     teacher = Teacher(env_sampler.task_names, gamma=FLAGS.gamma)
 
-    weights_all = collections.deque([], 500)
-    arm_probs_all = collections.deque([], 500)
+    weights_all = collections.deque([], 50)
+    arm_probs_all = collections.deque([], 50)
 
     agent = Agent(len(action_set), obs_spec)
     structure = build_actor(agent, env, '', action_set)
@@ -773,15 +773,16 @@ def train(action_set):
             weights_all.append((num_teacher_update, teacher._log_weights))
             arm_probs_all.append((num_teacher_update,
                                   teacher.task_probabilities))
-            np.save(
-                os.path.join(FLAGS.logdir, "teaching_output_{}_{}.npy".format(
-                    num_teacher_update, num_env_frames_v)), {
-                        "weights": weights_all,
-                        "arm_probs": arm_probs_all,
-                        "task_returns": dict(task_returns),
-                        "num_env_frames": num_env_frames_v,
-                        "num_teacher_update": num_teacher_update
-                    })
+            if num_teacher_update % 49 == 0:
+              np.save(
+                  os.path.join(FLAGS.logdir, "teaching_output_{}_{}.npy".format(
+                      num_teacher_update, num_env_frames_v)), {
+                          "weights": weights_all,
+                          "arm_probs": arm_probs_all,
+                          "task_returns": dict(task_returns),
+                          "num_env_frames": num_env_frames_v,
+                          "num_teacher_update": num_teacher_update
+                  })
             summary_teacher = tf.summary.Summary()
             summary_teacher.value.add(
                 tag='Teacher/at_update_student_progress',
