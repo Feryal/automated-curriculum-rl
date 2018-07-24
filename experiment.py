@@ -238,7 +238,7 @@ class Teacher(object):
 
   @property
   def task_probabilities(self):
-    weights = np.exp(self._log_weights)
+    weights = np.exp(self._log_weights - np.sum(self._log_weights))
     return (1 - self._gamma)*weights / np.sum(weights) + self._gamma/self._n_tasks
 
   def get_task(self):
