@@ -450,9 +450,9 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
     params = tf.trainable_variables()
     gradients = tf.gradients(total_loss, params)
     gradient_norm = tf.global_norm(gradients)
-    # TODO renormalize gradients hack, should be done better...
+    # TODO renormalize gradients hack, should be done adaptively...
     progress_signal = tf.divide(
-        gradient_norm, 500., name='progress_gradient_norm')
+        gradient_norm, 5000., name='progress_gradient_norm')
 
   # Merge updating the network and environment frames into a single tensor.
   with tf.control_dependencies([train_op]):
