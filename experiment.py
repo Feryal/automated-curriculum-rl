@@ -96,9 +96,9 @@ flags.DEFINE_float('epsilon', .1, 'RMSProp epsilon.')
 flags.DEFINE_float(
     'gamma', 0.2, 'Controls the minimum sampling probability for each task')
 flags.DEFINE_float('eta', 0.3, 'Learning rate of teacher')
-flags.DEFINE_enum(
-    'progress_signal', 'advantage', ['reward', 'gradient_norm', 'advantage'],
-    'Type of signal to use when tracking down progress of students. ')
+flags.DEFINE_enum('progress_signal', 'advantage',
+                  ['reward', 'gradient_norm', 'advantage', 'random'],
+                  'Type of signal to use when tracking down progress of students. ')
 flags.DEFINE_integer(
     'switch_tasks_every_k_frames', int(1e4),
     'We will trigger a refresh of the tasks after K environment frames.'
@@ -483,6 +483,8 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs,
     # TODO renormalize gradients hack, should be done adaptively...
     progress_signal = tf.divide(
         gradient_norm, 500., name='progress_gradient_norm')
+  else:
+    progress_signal = tf.constant(0.)
 
   # Merge updating the network and environment frames into a single tensor.
   with tf.control_dependencies([train_op]):
@@ -885,7 +887,8 @@ def train(action_set):
               progress_for_teacher = np.mean(progress_since_switch or 0)
 
             # Update Teacher according to the progress signal we got!
-            teacher.update(teacher_selected_task_name, progress_for_teacher)
+            if FLAGS.progress_signal != 'random':
+              teacher.update(teacher_selected_task_name, progress_for_teacher)
 
             # Log / Tensorboard
             tf.logging.info("[%d][%d] Task: %s, Episode return mean: %.3f, "
