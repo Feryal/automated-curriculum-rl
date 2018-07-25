@@ -50,9 +50,6 @@ FLAGS = tf.app.flags.FLAGS
 flags.DEFINE_string('logdir', '../results', 'TensorFlow log directory.')
 flags.DEFINE_enum('mode', 'train', ['train', 'test'], 'Training or test mode.')
 
-# Flags used for testing.
-flags.DEFINE_integer('test_num_episodes', 10, 'Number of episodes per level.')
-
 # Flags used for distributed training.
 flags.DEFINE_integer('task', -1, 'Task id. Use -1 for local training.')
 flags.DEFINE_enum('job_name', 'learner', ['learner', 'actor'],
@@ -102,10 +99,19 @@ flags.DEFINE_float(
     'gamma', 0.2, 'Controls the minimum sampling probability for each task')
 flags.DEFINE_float('eta', 0.3, 'Learning rate of teacher')
 flags.DEFINE_enum(
-    'progress_signal', 'reward', ['reward', 'gradient_norm'],
+    'progress_signal', 'advantage', ['reward', 'gradient_norm', 'advantage'],
     'Type of signal to use when tracking down progress of students. ')
 flags.DEFINE_integer('save_every_k_teacher_updates', int(50),
                      'Write the Teacher signals to files at this frequency.')
+
+
+# Flags used for testing/evaluation
+flags.DEFINE_integer('test_num_episodes', 30, 'Number of episodes per level.')
+flags.DEFINE_integer(
+    'evaluate_every_k_frames', int(1e5),
+    'Perform a full evaluation on all tasks after K environment frames.'
+)
+
 
 # Structure to be sent from actors to learner.
 ActorOutput = collections.namedtuple(
@@ -256,8 +262,10 @@ class Teacher(object):
 
 def build_actor(agent, env, task_name_op, action_set):
   """Builds the actor loop."""
+  if isinstance(task_name_op, str):
+    task_name_op = tf.constant(task_name_op)
   # Initial values.
-  initial_env_output, initial_env_state = env.initial()
+  initial_env_output, initial_env_state = env.initial(task_name_op)
   initial_agent_state = agent.initial_state(1)
   initial_action = tf.zeros([1], dtype=tf.int32)
   dummy_agent_output, _ = agent(
@@ -367,7 +375,8 @@ def compute_policy_gradient_loss(logits, actions, advantages):
   return tf.reduce_sum(policy_gradient_loss_per_timestep)
 
 
-def build_learner(agent, agent_state, env_outputs, agent_outputs):
+def build_learner(agent, agent_state, env_outputs, agent_outputs,
+                  teacher_task_ph):
   """Builds the learner loop.
 
   Args:
@@ -385,6 +394,7 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
   """
   learner_outputs, _ = agent.unroll(agent_outputs.action, env_outputs,
                                     agent_state)
+  teacher_selected_task = tf.identity(teacher_task_ph)
 
   # Use last baseline value (from the value function) to bootstrap.
   bootstrap_value = learner_outputs.baseline[-1]
@@ -441,10 +451,27 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs):
 
   # Compute progress signal
   if FLAGS.progress_signal == 'reward':
-    # Rewards is TxB, but as gradient_norm below gives only a scalar, let's convert it to a scalar too.
-    # we sum across time T and average across batch B, similar to what student_progress below is.
-    progress_signal = tf.reduce_mean(
-        tf.reduce_sum(rewards, axis=0), name='progress_reward')
+    # Keep returns at end of episodes.
+    # Discard parts of the minibatch using other tasks than what the Teacher
+    # expects.
+    episode_returns_correct_task = tf.boolean_mask(
+        rewards,
+        tf.logical_and(done, tf.equal(infos.task_name, teacher_selected_task)))
+    progress_signal = tf.where(
+        tf.size(episode_returns_correct_task) > 0,
+        x=tf.reduce_mean(episode_returns_correct_task, name='progress_reward'),
+        y=0)
+  elif FLAGS.progress_signal == 'advantage':
+    # For Advantage, we will compute returns[t] - returns[t-k] below, when
+    # preparing to update the Teacher.
+    # So just return reward[t] (again handling the wrong tasks parts)
+    episode_returns_correct_task = tf.boolean_mask(
+        rewards,
+        tf.logical_and(done, tf.equal(infos.task_name, teacher_selected_task)))
+    progress_signal = tf.where(
+        tf.size(episode_returns_correct_task) > 0,
+        x=tf.reduce_mean(episode_returns_correct_task, name='progress_reward'),
+        y=0)
   elif FLAGS.progress_signal == 'gradient_norm':
     # compute norm of gradients as the progress signal
     params = tf.trainable_variables()
@@ -492,15 +519,19 @@ def create_environment(env_sampler,
   return flow_env
 
 
-def update_all_actors_tasks(new_tasks_assignments, actor_task_name_params, session, single_task=False):
+def update_all_actors_tasks(new_tasks_assignments,
+                            actor_task_name_params,
+                            session,
+                            single_task=False):
   feed_dict = {}
   for actor_i in range(FLAGS.num_actors):
     if single_task:
       actor_task_name_params['task_name'][actor_i] = new_tasks_assignments[0]
     else:
-      actor_task_name_params['task_name'][actor_i] = new_tasks_assignments[actor_i]
-    feed_dict[actor_task_name_params['ph']
-              [actor_i]] = actor_task_name_params['task_name'][actor_i]
+      actor_task_name_params['task_name'][actor_i] = new_tasks_assignments[
+          actor_i]
+    feed_dict[actor_task_name_params['ph'][actor_i]] = actor_task_name_params[
+        'task_name'][actor_i]
   # Update tasks for all actors
   session.run(actor_task_name_params['update'], feed_dict=feed_dict)
 
@@ -581,6 +612,8 @@ def train(action_set):
       agent = Agent(len(action_set), obs_spec)
 
       # Setup the task names variables and assignment logic
+      teacher_task_ph = tf.placeholder(
+            dtype=tf.string, shape=(), name='teacher_task_name')
       task_names = env_sampler.task_names
       actor_task_name_params = collections.defaultdict(list)
       for actor_i in range(FLAGS.num_actors):
@@ -634,6 +667,17 @@ def train(action_set):
         with tf.device(shared_job_device):
           enqueue_ops.append(queue.enqueue(nest.flatten(actor_output)))
 
+    # Build evaluation ops for every task, which will keep computing returns
+    # on all tasks.
+    evaluation_output = {}
+    if is_learner:
+      with tf.name_scope("evaluation"):
+        for task_name in task_names:
+          env = create_environment(
+              env_sampler, initial_task_name=task_name, seed=1)
+          evaluation_output[task_name] = build_actor(
+              agent, env, task_name, action_set)
+
     # If running in a single machine setup, run actors with QueueRunners
     # (separate threads).
     if is_learner and enqueue_ops:
@@ -678,7 +722,7 @@ def train(action_set):
         done, infos, num_env_frames_and_train, progress_signal = (
             build_learner(agent, data_from_actors.agent_state,
                           data_from_actors.env_outputs,
-                          data_from_actors.agent_outputs))
+                          data_from_actors.agent_outputs, teacher_task_ph))
 
     # Create MonitoredSession (to run the graph, checkpoint and log).
     tf.logging.info('Creating MonitoredSession, is_chief %s', is_learner)
@@ -704,36 +748,43 @@ def train(action_set):
         num_env_frames_v = 0
         num_teacher_update = 0
         next_task_switch_at = FLAGS.switch_tasks_every_k_frames
-        last_return_tasks = {}
+        last_return_tasks = collections.defaultdict(float)
+        task_average_returns = collections.defaultdict(float)
+        advantage_previous_returns = collections.defaultdict(float)
         progress_since_switch = []
         returns_task_since_switch = collections.defaultdict(list)
         teacher_history = collections.defaultdict(dict)
+        evaluation_task_returns = collections.defaultdict(float)
+        next_evaluation_at = FLAGS.evaluate_every_k_frames
+
+        teacher_selected_task_name = actor_task_name_params['task_name'][0]
 
         while num_env_frames_v < FLAGS.total_environment_frames:
           # Perform one training step, on a minibatch.
-          (task_names_v, done_v, infos_v, num_env_frames_v, progress_signal_v,
+          (done_v, infos_v, num_env_frames_v, progress_signal_v,
            _) = session.run(
-               (data_from_actors.task_name, done, infos,
-                num_env_frames_and_train, progress_signal, stage_op))
-
-          # Keep the progress_signal across training batches, and average them
-          # later when the Teacher needs to switch
-          progress_since_switch.append(progress_signal_v)
+               (done, infos,
+                num_env_frames_and_train, progress_signal, stage_op),
+               feed_dict={
+                   teacher_task_ph: teacher_selected_task_name
+               })
 
           # Per task, let's average metrics in the current minibatch.
           for task_name in task_names:
-            # TODO note that for now, the full minibatch has the same task, so
-            # this for-loop is overkill, but it's future-proof.
-            # Check it later to be sure it works as expected.
-
-            # Only keep the minibatch_i (2nd dim) for the current task.
-            done_task = done_v[:, task_names_v == task_name]
-
-            if done_task.size > 0:
+            # Only keep part of the minibatch for the current task.
+            done_task = done_v & (infos_v.task_name == task_name)
+            if np.any(done_task):
               # This task was present in this minibatch
               task_episode_return = np.mean(infos_v.episode_return[done_task])
               task_episode_frames = np.mean(
                   infos_v.episode_step[done_task] * FLAGS.num_action_repeats)
+
+              if task_name == teacher_selected_task_name:
+                # Keep the progress_signal across training batches.
+                # Only do so if the task corresponds to what the Teacher asked.
+                # This will discard progress_signal_v for minibatches that have
+                # old tasks.
+                progress_since_switch.append(progress_signal_v)
 
               # For every task, keep the last returns.
               last_return_tasks[task_name] = task_episode_return
@@ -762,51 +813,87 @@ def train(action_set):
             # This will keep the last score even when the task is not retrained
             # on, but that's actually what Tensorboard shows, so it's ok.
             returns_task_since_switch[task_name].append(
-                last_return_tasks.get(task_name, 0))
+                last_return_tasks[task_name])
+
+          # Perform a full evaluation on all tasks
+          if num_env_frames_v >= next_evaluation_at:
+            summary_evaluator = tf.summary.Summary()
+
+            for task_name in task_names:
+              returns = []
+              while len(returns) < FLAGS.test_num_episodes:
+                rewards_v, done_v = session._tf_sess().run(
+                    (evaluation_output[task_name].env_outputs.reward,
+                     evaluation_output[task_name].env_outputs.done))
+
+                # Repack the environment outputs
+                rewards_v = rewards_v[1:]
+                done_v = done_v[1:]
+
+                # Check the performance
+                episode_returns = rewards_v[done_v]
+                returns.extend(episode_returns)
+
+              # Store mean returns per task
+              returns_avg = np.mean(returns)
+              evaluation_task_returns[task_name] = returns_avg
+
+              # Logging/Tensorboard
+              tf.logging.info('[%d] Evaluating task %s -> episode return: %f',
+                              num_env_frames_v, task_name, returns_avg)
+              summary_evaluator.value.add(
+                  tag='Evaluation/' + task_name + '/episode_return',
+                  simple_value=returns_avg)
+
+              # Also use these evaluation values to bootstrap the Advantage
+              # previous rewards
+              advantage_previous_returns[task_name] = returns_avg
+
+            summary_writer.add_summary(summary_evaluator, num_env_frames_v)
+            next_evaluation_at += FLAGS.evaluate_every_k_frames
 
           # Now ask the Teacher for new tasks to train on!
           if num_env_frames_v >= next_task_switch_at:
             print("Let's update the tasks for all actors now!")
-            print(actor_task_name_params['task_name'])
 
-            # We are currently setting a single task for all actors.
-            last_selected_task_name = actor_task_name_params['task_name'][0]
-
-            # TODO progress_signal_v is being transformed to a Scalar in
-            # build_learner().
-            # This is because for tf.gradient_norm, we get the sum, whereas for
-            # rewards, we have access to a TxB tensor (which we sum across time
-            # T and average across batch B)
-            progress_for_teacher = np.mean(progress_since_switch)
-
-            # Update Teacher according to the progress signal we got!
-            teacher.update(last_selected_task_name, progress_for_teacher)
-
-            # Compute average return for all tasks since last switch
+            # Compute average return for ~all tasks since last switch
             task_average_returns = {
                 task_name: np.mean(returns_task_since_switch[task_name])
                 for task_name in task_names
             }
 
-            # Get new task from the Teacher and update Actors
-            actor_task_assignments = [teacher.get_task()]
-            update_all_actors_tasks(
-                actor_task_assignments,
-                actor_task_name_params,
-                session._tf_sess(),
-                single_task=True)
+            # Compute the progress signal for the Teacher
+            if FLAGS.progress_signal == 'advantage':
+              # For the Advantage (reward[T] - reward[T-K]), we need to compare
+              # to "previous" reward values.
+              # Previous rewards are either evaluation_task_returns or
+              # task_average_returns, whichever is "fresher"
+              rewards_post_switch = np.mean(progress_since_switch or 0)
+              progress_for_teacher = (
+                  rewards_post_switch -
+                  advantage_previous_returns[teacher_selected_task_name])
+
+              # Update last returns
+              advantage_previous_returns[
+                  teacher_selected_task_name] = rewards_post_switch
+            else:
+              # For the other signals, we can use them directly.
+              progress_for_teacher = np.mean(progress_since_switch or 0)
+
+            # Update Teacher according to the progress signal we got!
+            teacher.update(teacher_selected_task_name, progress_for_teacher)
 
             # Log / Tensorboard
             tf.logging.info("[%d][%d] Task: %s, Episode return mean: %.3f, "
                             "Teacher progress signal: %.3f",
                             num_teacher_update, num_env_frames_v,
-                            last_selected_task_name,
-                            task_average_returns[last_selected_task_name],
+                            teacher_selected_task_name,
+                            task_average_returns[teacher_selected_task_name],
                             progress_for_teacher)
             summary_teacher = tf.summary.Summary()
             summary_teacher.value.add(
                 tag='Teacher/at_update_task_returns',
-                simple_value=task_average_returns[last_selected_task_name])
+                simple_value=task_average_returns[teacher_selected_task_name])
             summary_teacher.value.add(
                 tag='Teacher/at_update_progress_signal',
                 simple_value=progress_for_teacher)
@@ -819,12 +906,14 @@ def train(action_set):
                 teacher._log_weights.copy())
             teacher_history['arm_probs'][num_teacher_update] = (
                 teacher.task_probabilities.copy())
-            teacher_history['last_selected_task_name'][num_teacher_update] = (
-                last_selected_task_name)
+            teacher_history['teacher_selected_task_name'][num_teacher_update] = (
+                teacher_selected_task_name)
             teacher_history['num_env_frames'][num_teacher_update] = (
                 num_env_frames_v)
             teacher_history['task_returns'][num_teacher_update] = (
                 task_average_returns)
+            teacher_history['evaluation_task_returns'][num_teacher_update] = (
+                evaluation_task_returns)
             teacher_history['task_names'] = task_names
 
             # Store teacher history for analysis
@@ -837,12 +926,21 @@ def train(action_set):
               # Reset teacher history to be super safe
               teacher_history = collections.defaultdict(dict)
 
+            # Get new task from the Teacher and update Actors
+            teacher_selected_task_name = teacher.get_task()
+            update_all_actors_tasks(
+                [teacher_selected_task_name],
+                actor_task_name_params,
+                session._tf_sess(),
+                single_task=True)
+
             # ... finish this switch
             progress_since_switch = []
             returns_task_since_switch = collections.defaultdict(list)
             num_teacher_update += 1
             next_task_switch_at += FLAGS.switch_tasks_every_k_frames
-            print("done! next update at {}".format(next_task_switch_at))
+            print("Switching to task {}! Next update at {}".format(
+                teacher_selected_task_name, next_task_switch_at))
 
       else:
         # Execute actors (they just need to enqueue their output).

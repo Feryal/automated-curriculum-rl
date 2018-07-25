@@ -105,8 +105,8 @@ class PyProcessCraftLab(object):
       )
 
 
-StepOutputInfo = collections.namedtuple('StepOutputInfo',
-                                        'episode_return episode_progress episode_step')
+StepOutputInfo = collections.namedtuple(
+  'StepOutputInfo', 'episode_return episode_progress episode_step task_name')
 StepOutput = collections.namedtuple('StepOutput',
                                     'reward info done observation')
 
@@ -132,7 +132,7 @@ class FlowEnvironment(object):
     """
     self._env = env
 
-  def initial(self):
+  def initial(self, task_name):
     """Returns the initial output and initial state.
 
     Returns:
@@ -144,7 +144,8 @@ class FlowEnvironment(object):
     with tf.name_scope('flow_environment_initial'):
       initial_reward = tf.constant(0., dtype=tf.float32)
       initial_info = StepOutputInfo(
-          tf.constant(0., dtype=tf.float32), tf.constant(0., dtype=tf.float32), tf.constant(0))
+          tf.constant(0., dtype=tf.float32), tf.constant(0., dtype=tf.float32),
+          tf.constant(0), task_name)
       initial_done = tf.constant(True)
       initial_observation = self._env.initial()
 
@@ -190,11 +191,18 @@ class FlowEnvironment(object):
       # state for the next step.
       # TODO make progress be just the return for now (change later to reflect the progress signals)
       progress_update = reward
-      new_info = StepOutputInfo(info.episode_return + reward, info.episode_progress + progress_update,
-                                info.episode_step + 1)
-      new_state = new_flow, nest.map_structure(
-          lambda a, b: tf.where(done, a, b),
-          StepOutputInfo(tf.constant(0., dtype=tf.float32), tf.constant(0., dtype=tf.float32), tf.constant(0)), new_info)
+      new_info = StepOutputInfo(info.episode_return + reward,
+                                info.episode_progress + progress_update,
+                                info.episode_step + 1,
+                                task_name)
+      new_state = (new_flow,
+                   nest.map_structure(lambda a, b: tf.where(done, a, b),
+                                      StepOutputInfo(
+                                          tf.constant(0., dtype=tf.float32),
+                                          tf.constant(0., dtype=tf.float32),
+                                          tf.constant(0),
+                                          task_name),
+                                      new_info))
 
       output = StepOutput(reward, new_info, done, observation)
 
