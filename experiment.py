@@ -917,7 +917,7 @@ def train(action_set):
             teacher_history['task_returns'][num_teacher_update] = (
                 task_average_returns)
             teacher_history['evaluation_task_returns'][num_teacher_update] = (
-                evaluation_task_returns)
+                evaluation_task_returns.copy())
             teacher_history['task_names'] = task_names
 
             # Store teacher history for analysis
