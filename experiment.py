@@ -175,8 +175,32 @@ class Agent(snt.RNNCore):
         obs_name: observations[obs_i]
         for obs_i, obs_name in enumerate(self._obs_specs.keys())
     }
-    features_out = tf.nn.relu(observations_dict['features'])
-    features_out = snt.BatchFlatten()(features_out)
+    with tf.variable_scope('convnet'):
+      conv_out = observations_dict['pixels']
+      for i, (num_ch, num_blocks) in enumerate([(16, 2), (32, 2), (32, 2)]):
+        # Downscale.
+        conv_out = snt.Conv2D(num_ch, 3, stride=1, padding='SAME')(conv_out)
+        conv_out = tf.nn.pool(
+            conv_out,
+            window_shape=[2, 2],
+            pooling_type='MAX',
+            padding='SAME',
+            strides=[2, 2])
+        # Residual block(s).
+        for j in range(num_blocks):
+          with tf.variable_scope('residual_%d_%d' % (i, j)):
+            block_input = conv_out
+            conv_out = tf.nn.relu(conv_out)
+            conv_out = snt.Conv2D(num_ch, 3, stride=1, padding='SAME')(conv_out)
+            conv_out = tf.nn.relu(conv_out)
+            conv_out = snt.Conv2D(num_ch, 3, stride=1, padding='SAME')(conv_out)
+            conv_out += block_input
+
+    conv_out = tf.nn.relu(conv_out)
+    features_out = snt.BatchFlatten()(conv_out)
+
+    # features_out = tf.nn.relu(conv_out)
+    # features_out = snt.BatchFlatten()(features_out)
 
     features_out = snt.Linear(256)(features_out)
     features_out = tf.nn.relu(features_out)
@@ -184,10 +208,10 @@ class Agent(snt.RNNCore):
     instruction_out = self._instruction(observations_dict['task_name'])
 
     # Append clipped last reward and one hot last action.
-    clipped_reward = tf.expand_dims(tf.clip_by_value(reward, -1, 1), -1)
+    # clipped_reward = tf.expand_dims(tf.clip_by_value(reward, -1, 1), -1)
     one_hot_last_action = tf.one_hot(last_action, self._num_actions)
     return tf.concat(
-        [features_out, clipped_reward, one_hot_last_action, instruction_out],
+        [features_out, one_hot_last_action, observations_dict['inventory'], observations_dict['pos'], observations_dict['dir'],  instruction_out],
         axis=1)
 
   def _head(self, core_output):
