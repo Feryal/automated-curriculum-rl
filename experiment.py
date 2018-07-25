@@ -81,12 +81,10 @@ flags.DEFINE_string(
 flags.DEFINE_integer(
     'max_steps', 100,
     'Maximum number of steps before the environment terminates on a failure.')
-
-# Curriculum settings.
-flags.DEFINE_integer(
-    'switch_tasks_every_k_frames', int(1e4),
-    'We will trigger a refresh of the tasks after K environment frames.'
-)
+flags.DEFINE_bool(
+    'reuse_environments', False,
+    'If set, will use a single environment per task, simplifying tasks'
+    'dramatically.')
 
 # Optimizer settings.
 flags.DEFINE_float('learning_rate', 0.00048, 'Learning rate.')
@@ -101,6 +99,10 @@ flags.DEFINE_float('eta', 0.3, 'Learning rate of teacher')
 flags.DEFINE_enum(
     'progress_signal', 'advantage', ['reward', 'gradient_norm', 'advantage'],
     'Type of signal to use when tracking down progress of students. ')
+flags.DEFINE_integer(
+    'switch_tasks_every_k_frames', int(1e4),
+    'We will trigger a refresh of the tasks after K environment frames.'
+)
 flags.DEFINE_integer('save_every_k_teacher_updates', int(50),
                      'Write the Teacher signals to files at this frequency.')
 
@@ -175,7 +177,8 @@ class Agent(snt.RNNCore):
         obs_name: observations[obs_i]
         for obs_i, obs_name in enumerate(self._obs_specs.keys())
     }
-    features_out = tf.nn.relu(observations_dict['features'])
+    features_out = snt.Linear(256)(observations_dict['features'])
+    features_out = tf.nn.relu(features_out)
     features_out = snt.BatchFlatten()(features_out)
 
     features_out = snt.Linear(256)(features_out)
@@ -479,7 +482,7 @@ def build_learner(agent, agent_state, env_outputs, agent_outputs,
     gradient_norm = tf.global_norm(gradients)
     # TODO renormalize gradients hack, should be done adaptively...
     progress_signal = tf.divide(
-        gradient_norm, 5000., name='progress_gradient_norm')
+        gradient_norm, 500., name='progress_gradient_norm')
 
   # Merge updating the network and environment frames into a single tensor.
   with tf.control_dependencies([train_op]):
@@ -588,7 +591,8 @@ def train(action_set):
     # here the meta learning algorithm should propose the task
 
     env_sampler = env_factory.EnvironmentFactory(
-        FLAGS.recipes_path, FLAGS.hints_path, max_steps=FLAGS.max_steps, seed=1)
+        FLAGS.recipes_path, FLAGS.hints_path, max_steps=FLAGS.max_steps,
+        reuse_environments=FLAGS.reuse_environments, seed=1)
     dummy_env = env_sampler.sample_environment()
     obs_spec = dummy_env.obs_specs()
     env = create_environment(env_sampler, seed=1)
@@ -871,11 +875,11 @@ def train(action_set):
               rewards_post_switch = np.mean(progress_since_switch or 0)
               progress_for_teacher = (
                   rewards_post_switch -
-                  advantage_previous_returns[teacher_selected_task_name])
+                  evaluation_task_returns[teacher_selected_task_name])
 
               # Update last returns
-              advantage_previous_returns[
-                  teacher_selected_task_name] = rewards_post_switch
+              # advantage_previous_returns[
+              # teacher_selected_task_name] = rewards_post_switch
             else:
               # For the other signals, we can use them directly.
               progress_for_teacher = np.mean(progress_since_switch or 0)
@@ -953,7 +957,8 @@ def test(action_set):
   with tf.Graph().as_default():
     # Get EnvironmentFactory
     env_sampler = env_factory.EnvironmentFactory(
-        FLAGS.recipes_path, FLAGS.hints_path, max_steps=FLAGS.max_steps, seed=1, visualise=True)
+        FLAGS.recipes_path, FLAGS.hints_path, max_steps=FLAGS.max_steps,
+        reuse_environments=FLAGS.reuse_environments, seed=1, visualise=True)
     dummy_env = env_sampler.sample_environment()
     obs_spec = dummy_env.obs_specs()
     task_names = sorted(env_sampler.task_names)

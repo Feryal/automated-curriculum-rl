@@ -39,10 +39,14 @@ DEFAULT_ACTION_SET = (
 class PyProcessCraftLab(object):
   """CraftLab wrapper for PyProcess."""
 
-  def __init__(self, env_sampler, task_name, config, num_action_repeats=1, seed=0,
-               runfiles_path=None, level_cache=None):
-
-    del runfiles_path, level_cache, config
+  def __init__(self,
+               env_sampler,
+               task_name,
+               config,
+               num_action_repeats=1,
+               seed=0,
+               reuse_environments=False):
+    del config
     self._num_action_repeats = num_action_repeats
     self._random_state = np.random.RandomState(seed=seed)
     # config = {k: str(v) for k, v in config.iteritems()}
