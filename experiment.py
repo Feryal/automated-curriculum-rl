@@ -873,7 +873,7 @@ def train(action_set):
               # Previous rewards are either evaluation_task_returns or
               # task_average_returns, whichever is "fresher"
               rewards_post_switch = np.mean(progress_since_switch or 0)
-              progress_for_teacher = (
+              progress_for_teacher = np.abs(
                   rewards_post_switch -
                   evaluation_task_returns[teacher_selected_task_name])
 
