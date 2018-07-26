@@ -853,7 +853,9 @@ def train(action_set):
 
               # Also use these evaluation values to bootstrap the Advantage
               # previous rewards
-              advantage_previous_returns[task_name] = returns_avg
+              advantage_previous_returns[task_name] = (
+                  0.8 * advantage_previous_returns[task_name]
+                  + 0.2 * returns_avg)
 
             summary_writer.add_summary(summary_evaluator, num_env_frames_v)
             next_evaluation_at += FLAGS.evaluate_every_k_frames
@@ -877,11 +879,12 @@ def train(action_set):
               rewards_post_switch = np.mean(progress_since_switch or 0)
               progress_for_teacher = np.abs(
                   rewards_post_switch -
-                  evaluation_task_returns[teacher_selected_task_name])
+                  advantage_previous_returns[teacher_selected_task_name])
 
               # Update last returns
-              # advantage_previous_returns[
-              # teacher_selected_task_name] = rewards_post_switch
+              advantage_previous_returns[teacher_selected_task_name] = (
+                  0.9 * advantage_previous_returns[teacher_selected_task_name]
+                  + 0.1 * rewards_post_switch)
             else:
               # For the other signals, we can use them directly.
               progress_for_teacher = np.mean(progress_since_switch or 0)
@@ -891,11 +894,12 @@ def train(action_set):
               teacher.update(teacher_selected_task_name, progress_for_teacher)
 
             # Log / Tensorboard
-            tf.logging.info("[%d][%d] Task: %s, Episode return mean: %.3f, "
-                            "Teacher progress signal: %.3f",
+            tf.logging.info("[%d][%d] Task: %s, Episode return mean: %.1f, "
+                            "\n\tTeacher progress signal %s: %.3f",
                             num_teacher_update, num_env_frames_v,
                             teacher_selected_task_name,
                             task_average_returns[teacher_selected_task_name],
+                            FLAGS.progress_signal,
                             progress_for_teacher)
             summary_teacher = tf.summary.Summary()
             summary_teacher.value.add(
