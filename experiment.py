@@ -105,7 +105,10 @@ flags.DEFINE_integer(
 )
 flags.DEFINE_integer('save_every_k_teacher_updates', int(50),
                      'Write the Teacher signals to files at this frequency.')
-
+flags.DEFINE_bool('actors_same_task', True,
+                  'If True, all actors are given the same task.'
+                  'If False, leads to weird situation with a Teacher, but '
+                  'gives baseline IMPALA back with progress_signal=random')
 
 # Flags used for testing/evaluation
 flags.DEFINE_integer('test_num_episodes', 30, 'Number of episodes per level.')
@@ -623,9 +626,16 @@ def train(action_set):
       task_names = env_sampler.task_names
       actor_task_name_params = collections.defaultdict(list)
       for actor_i in range(FLAGS.num_actors):
-        # Assign initial task name by round-robin
-        # initial_task_name = task_names[actor_i % len(task_names)]
-        initial_task_name = task_names[0]
+        if FLAGS.actors_same_task:
+          # Initialise all actors to the same task
+          initial_task_name = task_names[0]
+        else:
+          # Assign initial task name by round-robin
+          initial_task_name = task_names[actor_i % len(task_names)]
+          assert FLAGS.progress_signal == 'random', (
+              "Using different tasks per actors with a Teacher hasn't been "
+              "tested. Use progress_signal=random.")
+
         # Setup variables and assignment logic
         actor_task_name_var = tf.get_variable(
             "task_name_actor_{}".format(actor_i),
@@ -938,12 +948,24 @@ def train(action_set):
               teacher_history = collections.defaultdict(dict)
 
             # Get new task from the Teacher and update Actors
-            teacher_selected_task_name = teacher.get_task()
-            update_all_actors_tasks(
-                [teacher_selected_task_name],
-                actor_task_name_params,
-                session._tf_sess(),
-                single_task=True)
+            if FLAGS.actors_same_task:
+              teacher_selected_task_name = teacher.get_task()
+              actor_task_assignments = [teacher_selected_task_name]
+              update_all_actors_tasks(
+                  actor_task_assignments,
+                  actor_task_name_params,
+                  session._tf_sess(),
+                  single_task=True)
+            else:
+              actor_task_assignments = np.random.choice(
+                  task_names,
+                  FLAGS.num_actors,
+                  replace=FLAGS.num_actors > len(task_names))
+              update_all_actors_tasks(
+                  actor_task_assignments,
+                  actor_task_name_params,
+                  session._tf_sess(),
+                  single_task=False)
 
             # ... finish this switch
             progress_since_switch = []
@@ -951,7 +973,8 @@ def train(action_set):
             num_teacher_update += 1
             next_task_switch_at += FLAGS.switch_tasks_every_k_frames
             print("Switching to task {}! Next update at {}".format(
-                teacher_selected_task_name, next_task_switch_at))
+                actor_task_assignments, next_task_switch_at))
+
 
       else:
         # Execute actors (they just need to enqueue their output).
