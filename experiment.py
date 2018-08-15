@@ -969,10 +969,11 @@ def test(action_set):
     dummy_env = env_sampler.sample_environment()
     obs_spec = dummy_env.obs_specs()
     task_names = sorted(env_sampler.task_names)
+    dummy_env.render_matplotlib()
 
     agent = Agent(len(action_set), obs_spec)
     outputs = {}
-    task_returns = collections.defaultdict(lambda: collections.deque([], 5000))
+    task_returns = collections.defaultdict(list)
 
     # Test on all environments one after another
     for task_name in task_names:
@@ -985,7 +986,8 @@ def test(action_set):
             hooks=[py_process.PyProcessHook()]) as session:
       for task_name in task_names:
         tf.logging.info('Testing task: %s', task_name)
-        while True:
+        returns = task_returns[task_name]
+        while len(returns) < FLAGS.test_num_episodes:
           rewards_v, done_v, observations_v = session.run(
               (outputs[task_name].env_outputs.reward,
                outputs[task_name].env_outputs.done,
@@ -1001,20 +1003,31 @@ def test(action_set):
 
           # Check the performance
           episode_returns = rewards_v[done_v]
-          returns = task_returns[task_name]
           returns.extend(episode_returns)
 
           # Visualise render
-          for frame_i, frame in enumerate(observations_dict['image']):
-            dummy_env.render_matplotlib(frame=frame, delta_time=0.05)
+          num_episodes_seen = 0
+          for frame_i, frame in enumerate(observations_dict['image'][:30]):
             if rewards_v[frame_i]:
-              rewarding_frame = np.ones_like(frame) * np.array([0, 1, 0])
+              rewarding_frame = observations_dict['image'][frame_i - 1].copy()
+              rewarding_frame[:40] *= np.array([0, 1, 0])
               dummy_env.render_matplotlib(
-                  frame=rewarding_frame, delta_time=0.2)
+                  frame=rewarding_frame, delta_time=0.7)
+            else:
+              if frame_i == 0:
+                dummy_env.render_matplotlib(frame=frame, delta_time=1.5)
+              else:
+                dummy_env.render_matplotlib(frame=frame, delta_time=0.3)
+            if done_v[frame_i]:
+              num_episodes_seen += 1
 
-          if len(returns) >= FLAGS.test_num_episodes:
-            tf.logging.info('Mean episode return: %f', np.mean(returns))
-            break
+            if num_episodes_seen >= FLAGS.test_num_episodes:
+              break
+
+        returns_avg = np.mean(returns)
+        # Logging
+        tf.logging.info('Evaluating task %s -> episode return: %f',
+                        task_name, returns_avg)
 
 
 def main(_):
