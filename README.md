@@ -34,9 +34,10 @@ I have done multiple modifications to the Craft Environment and IMPALA code for 
 
 <p>
 <img src="https://github.com/Feryal/craft-env/blob/master/assets/trained_agent.gif"/> <br />
-<b> Visualisation of a trained agent solving multiple tasks in [Craft Env](https://github.com/Feryal/craft-env). </b><br/>
+<b> Visualisation of a trained agent solving multiple tasks in Craft Env. </b><br/>
 The instruction is shown at the top, the 2D grid in the middle and the inventory is shown at the bottom. Each color correspond to a different object or workshop, the player is the red dot. For example in the "get grass" task, when the player picks up a green square (grass), the screen flashes to indicate a positive reward.
 </p>
+
 
 A link to an accompanying blog detailing all the methods and discussing the results: [rlcurriculum.github.io](https://rlcurriculum.github.io/)
 
